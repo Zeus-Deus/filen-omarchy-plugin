@@ -1316,7 +1316,7 @@ Panel {
               width: parent.width
               text: root.view === "transfers"
                 ? "c clear   \u00b7   t files   \u00b7   r refresh"
-                : "u upload  \u00b7  p paste  \u00b7  / filter  \u00b7  n new  \u00b7  x delete  \u00b7  t transfers"
+                : "u upload  \u00b7  p paste  \u00b7  / filter  \u00b7  n new  \u00b7  x delete"
               color: Qt.darker(root.foreground, 2.4)
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
