@@ -1,125 +1,170 @@
-# filen-omarchy-plugin
+# Filen for Omarchy
 
-Design notes for an Omarchy Quattro shell plugin that manages a
-[Filen](https://filen.io) end-to-end encrypted drive from the bar.
+An [Omarchy Quattro](https://omarchy.org) shell plugin that puts your
+[Filen](https://filen.io) end-to-end encrypted drive in the bar: browse it,
+download and open files in your normal viewers, upload into it, and watch
+transfers — without a browser or memorising CLI flags.
 
-Mockups: `mockups/index.html`
+Built for the Quickshell-based Omarchy 4 shell. Tested against Omarchy
+`4.0.0` and Filen CLI `0.2.7`.
 
-## Status
+## What it does
 
-Design study only. No plugin code written yet.
+**Bar widget** — the Filen mark, dimmed when idle, with a count of running
+transfers and a dot when something needs attention.
 
-## Key research findings
+**Panel** (click, or `omarchy-shell filen toggle`)
 
-### The CLI landscape changed — target the Rust CLI
+- Drive quota meter with used/total
+- File browser with breadcrumb, folders first, natural sort, real sizes
+- Type-aware icons; `Enter` on an image/video/PDF downloads it and opens it
+  in **your** configured viewer (imv, mpv, evince — via `xdg-open`)
+- Filter within a folder (`/`)
+- Upload via the desktop file chooser (`u`) or from the clipboard (`p`)
+- Create folders (`n`), delete to Filen trash with confirmation (`x`)
+- Transfers view (`t`) with live percentage, speed, ETA and working cancel
 
-- `FilenCloudDienste/filen-cli` (TypeScript, v0.0.36/0.0.39) is **sunset**.
-  Its README tells users to move on.
-- The replacement is the Rust rewrite at
-  `FilenCloudDienste/filen-rs/filen-cli`, distributed via
-  `FilenCloudDienste/filen-cli-releases`, currently **public beta v0.2.7**.
-- The Rust CLI **dropped** native `sync`, `mount`, `webdav`, `s3`.
-  Mounts and servers are now delegated to a **managed rclone**
-  (`filen mount`, `filen serve <webdav|ftp|sftp|http>`, `filen rclone <cmd>`).
-  Filen also landed an official rclone backend in rclone v1.73.
-- **Sync pairs are gone entirely** from the Rust CLI. Do not design for them.
+### Keys
 
-### Verified Rust CLI surface (read from `filen-cli/src/commands.rs` @ main)
+| Key | Browser | Transfers |
+|---|---|---|
+| `↑ ↓` / `j k` | move cursor | move cursor |
+| `→` / `l` | enter folder | — |
+| `←` / `h` / `Backspace` | up a folder | — |
+| `Enter` | folder: open · file: download & open | open finished download |
+| `o` | download and open | — |
+| `d` | download only | — |
+| `u` | upload via file chooser | — |
+| `p` | upload paths from clipboard | — |
+| `n` | new folder | — |
+| `y` | copy the remote path | — |
+| `x` | delete (to trash, confirmed) | cancel transfer |
+| `/` | filter this folder | — |
+| `r` | refresh | refresh |
+| `t` | transfers view | back to files |
+| `w` | open the web drive | — |
+| `c` | — | clear finished |
+| `Esc` | clear filter / close | back to files |
 
-Subcommands: `help cd ls cat head tail stat mkdir rm mv cp upload download
-search favorite unfavorite list-trash empty-trash export-auth-config rclone
-mount serve export-api-key view-html-docs logout exit`
+## Install
 
-Global flags that matter: `--json`, `--quiet`, `-v`, `--config-dir`,
-`--auth-config-path`, `--skip-update`, bandwidth/concurrency caps.
+Requires the Filen CLI. Install it yourself — the plugin never downloads or
+updates anything on your behalf:
 
-`--json` is implemented in exactly five places (`commands.rs`):
+```bash
+# review first: https://github.com/FilenCloudDienste/filen-cli-releases
+curl -sL https://raw.githubusercontent.com/FilenCloudDienste/filen-rs/refs/heads/main/filen-cli/install.sh -o /tmp/filen-install.sh
+less /tmp/filen-install.sh
+bash /tmp/filen-install.sh
+```
 
-| Command | JSON shape |
-|---|---|
-| `ls` | `{directories: string[], files: string[]}` — **names only, no sizes** |
-| `stat <file>` | `{name, type:"file", size, modified, created, uuid}` |
-| `stat <dir>` | `{name, type:"directory", created, uuid}` |
-| `stat /` | `{type:"drive", usedStorage, totalStorage}` |
-| `export-api-key` | `{email, apiKey}` — **never call this from the plugin** |
+Sign in once, in a terminal. The CLI stores the session in your system
+keyring; the plugin never sees your password:
 
-Consequence: a file listing with sizes costs `ls` + one `stat` per entry.
-Either accept that (batch, cache, lazy-load) or list names first and stat on
-cursor focus.
+```bash
+filen stat /      # prompts for email/password, answer "y" to stay signed in
+```
 
-`search` and `list-trash` are **interactive** commands — no scriptable form.
+Then add the plugin:
 
-### Auth model (read from `filen-cli/src/auth.rs` @ main)
+```bash
+omarchy plugin add https://github.com/<you>/filen-omarchy-plugin --enable --yes
+```
 
-Resolution order: CLI args → env (`FILEN_CLI_EMAIL` / `FILEN_CLI_PASSWORD` /
-`FILEN_CLI_2FA_CODE`) → auth config file → **system keyring** → interactive
-prompt.
+## Settings
 
-- Keyring entry name: `sdk-config`. This is the path the plugin should rely on.
-- Auth config file `filen-cli-auth-config.txt` (in `./`, `~/.filen-cli/`, or
-  the config dir) contains **master keys, private key and API key in
-  plaintext**, written mode 0600. The plugin must never read or display it.
-- There is no `keyring` write without the interactive "Keep me logged in?"
-  prompt — so login must happen in a terminal, not in QML.
+Configurable in `Setup > Plugins`, stored inline in `~/.config/omarchy/shell.json`.
 
-### Omarchy Quattro plugin contract (read from the live machine)
+| Setting | Default | Meaning |
+|---|---|---|
+| `refreshIntervalSec` | 300 | Background quota refresh (60–3600) |
+| `downloadDir` | `~/Downloads` | Where downloads land; validated |
+| `confirmDelete` | `true` | Confirm before moving to Filen trash |
+| `bandwidthLimit` | *(empty)* | e.g. `2M`, `500K`; empty = unlimited |
 
-- `~/.config/omarchy/plugins/<id>/manifest.json`, `schemaVersion: 1`,
-  id must not use the `omarchy.*` prefix.
-- Kinds: `bar-widget | panel | overlay | menu | service | bar`.
-  Entry via `entryPoints.barWidget` etc.
-- Enabled state lives in `~/.config/omarchy/shell.json`; third-party is
-  "enabled iff its id appears in the file".
-- Install: `omarchy plugin add <git-url> [--enable] [--yes]`.
-  Validate: `omarchy plugin validate .`.
-  Reload: saving under `~/.config/omarchy/plugins/` hot-reloads;
-  `omarchy-shell shell rescanPlugins` forces it; `Panel.qml` edits need
-  `omarchy-restart-shell`.
-- Plugins run **unsandboxed** in the single long-running `omarchy-shell`
-  Quickshell process. Never spawn a second Quickshell.
+## Security
 
-### Local environment (verified)
+Filen is zero-knowledge, and this plugin runs **unsandboxed inside the
+Omarchy shell process**. The design follows from those two facts.
 
-- Omarchy `4.0.0.r1846.g946704f-1`, theme `spiderman`, JetBrainsMono Nerd Font,
-  bar 26px, `decoration:rounding` = 0.
-- Installed reference plugins: `space.passpage.shares`,
-  `io.github.zeus-deus.gazelle` — both follow the
-  `Panel.qml` / `Service.qml` / `Model.js` / `tests/` shape.
-- `filen` is **not installed**. `rclone` is **not installed**.
-  `fusermount3`, `gum`, `jq`, `wl-copy`, `node` are present.
+- **Your password never touches the plugin.** There is no password field.
+  Sign-in happens in a real terminal running the CLI's own prompt; the CLI
+  stores the session in the system keyring.
+- **No secrets in argv.** `/proc/<pid>/cmdline` is world-readable. Verified
+  at runtime during a live transfer: the command lines contain only paths
+  and flags.
+- **No credential env vars.** `FILEN_CLI_PASSWORD` / `FILEN_CLI_EMAIL` are
+  never set, so nothing leaks into child processes.
+- **The auth config is never read.** `filen-cli-auth-config.txt` holds master
+  keys, the private key and the API key in plaintext. The plugin never reads,
+  copies or displays it, and never calls `export-api-key` /
+  `export-auth-config`.
+- **No shell.** Every command is an argv array, so a filename containing
+  `;`, `$()`, backticks or newlines is inert data. Native verbs get `--` so a
+  name starting with `-` can't become a flag.
+- **Remote output is treated as hostile.** Names come from shared folders and
+  can be anything. Responses are size-capped, JSON is parsed defensively, and
+  displayed text is stripped of control characters and bidi overrides, then
+  rendered as `PlainText`.
+- **Downloads are written under a sanitized name.** The remote path stays
+  byte-exact so the right object is fetched, but the local filename has bidi
+  and control characters removed. Without this, a drive file called
+  `ev<U+202E>gnp.exe` lands on your disk displaying as `evexe.gnp` — a real
+  bug this plugin had, found by testing against a hostile fixture.
+- **The updater never fires on its own.** Every call passes `--skip-update`;
+  updating the CLI is your decision.
+- **Deletes go to the Filen trash** and are confirmation-gated by default.
+  The plugin can never empty the trash or permanently delete.
+- **It warns about the CLI's own credential cache.** The Filen CLI writes
+  `~/.config/filen-cli/rclone/rclone.conf` — containing `master_keys`,
+  `api_key` and `private_key` in plaintext — as mode **0644**, readable by
+  every local user. The panel detects this and offers to `chmod 600` it.
+  *(Worth reporting upstream.)*
 
-## Scope ladder
+Run the audits:
 
-**v0.1** — glyph + quota badge, browse w/ breadcrumb, stat details, download,
-upload, favorites, open web drive. All clean `--json` / exit-code calls.
+```bash
+./scripts/security-audit.sh    # 21 static checks over the source
+./scripts/security-runtime.sh  # 7 checks against live processes
+```
 
-**v0.2** — transfers list w/ cancel, mounts & servers panel, trash view,
-completion notifications.
+## Notes on the Filen CLI
 
-**Blocked upstream** — search (needs non-interactive flag), public links (not
-in Rust CLI yet), notes/chats/contacts (SDK/API only). File these as feature
-requests at features.filen.io rather than working around them.
+Findings from reading the source and testing v0.2.7 — useful if you extend
+this:
 
-## Security rules
+- The **TypeScript CLI is sunset**; this targets the Rust rewrite
+  (`filen-rs/filen-cli`), currently public beta.
+- **Failures print to stdout, not stderr.** Classify on both or a signed-out
+  account reads as signed in.
+- v0.2.7 has **no `upload`/`download` subcommand** — those exist only on git
+  `main`. Transfers go through the bundled rclone (`filen rclone copyto`).
+- Native `ls --json` returns **names only**. `filen rclone lsjson` returns
+  name + size + mtime + MIME + IsDir in one call, so the browser uses that
+  instead of one `stat` per row.
+- **Offline is indistinguishable from signed-out** by message alone; both
+  produce `Failed to read input from terminal`. The plugin probes
+  connectivity before claiming your session is gone.
+- Each `filen rclone` run **rewrites `rclone.conf`** as it starts. Two
+  overlapping runs can catch it mid-write (`didn't find section in config
+  file`), so metadata calls are serialised and retried.
+- `filen` spawns rclone as a **child in the caller's process group**, so
+  cancelling requires `setsid` + a group signal.
 
-1. No password field in QML. Login via terminal → CLI prompt → keyring.
-2. Never read, copy or display `filen-cli-auth-config.txt`.
-3. Never call `export-api-key` or `export-auth-config` from the plugin.
-4. Never put secrets in argv (`/proc` is world-readable) or in env vars.
-5. Treat all CLI output as attacker-controlled — filenames come from shared
-   folders. Cap response size, parse JSON strictly, pass paths as positional
-   args.
-6. Servers bind loopback + read-only by default; public bind is explicit and
-   warned.
-7. Never trigger the CLI's auto-updater silently; pass `--skip-update` on
-   plugin-initiated calls and let the user update deliberately.
-8. Destructive actions go through `ConfirmDialog` defaulting to Cancel.
+## Development
 
-## References
+```bash
+node --test tests/model.test.js   # 79 unit tests, no Qt needed
+omarchy plugin validate .
+./scripts/dev-reload.sh           # sync, test, restart shell, check for errors
+```
 
-- Shell contract: `/usr/share/omarchy/shell/README.md`
-- Plugin catalogue: `/usr/share/omarchy/shell/plugins/README.md`
-- Plugin dev guide: https://omarchyplugins.com/develop.html
-- Filen CLI (Rust) source: https://github.com/FilenCloudDienste/filen-rs/tree/main/filen-cli
-- Filen CLI docs: https://docs.filen.io/docs/cli-rs/readme
-- Filen API/SDK docs: https://docs.filen.io/docs/api
+`tests/mock-filen` is a fake CLI for exercising states that are hard to
+reproduce live (signed out, empty drive, garbage JSON, huge listings, slow
+transfers). Point the plugin at it by putting it earlier in `PATH`.
+
+Architecture, conventions and traps: see [AGENTS.md](AGENTS.md).
+
+## Licence
+
+MIT
