@@ -506,3 +506,55 @@ test("safeLocalName leaves ordinary names untouched", () => {
   assert.strictEqual(M.safeLocalName("Ünïcode ファイル.txt"), "Ünïcode ファイル.txt");
   assert.strictEqual(M.safeLocalName("sunset.png"), "sunset.png");
 });
+
+// ─────────────────────────────────────────────── rclone progress
+// Verbatim line from `rclone copyto --use-json-log --stats 1s`.
+
+const REAL_STATS_LINE = '{"time":"2026-08-27T23:18:41.259913352+02:00","level":"notice","msg":"Transferred","stats":{"bytes":200000,"checks":0,"elapsedTime":0.14,"errors":0,"eta":8,"fatalError":false,"speed":1048576,"totalBytes":400000,"totalTransfers":1,"transfers":0}}';
+
+test("parseRcloneProgress reads a real stats line", () => {
+  const p = M.parseRcloneProgress(REAL_STATS_LINE);
+  assert.strictEqual(p.bytes, 200000);
+  assert.strictEqual(p.totalBytes, 400000);
+  assert.strictEqual(p.fraction, 0.5);
+  assert.strictEqual(p.speed, 1048576);
+  assert.strictEqual(p.eta, 8);
+});
+
+test("parseRcloneProgress takes the LAST stats line in a chunk", () => {
+  const chunk = [
+    REAL_STATS_LINE,
+    REAL_STATS_LINE.replace('"bytes":200000', '"bytes":400000')
+  ].join("\n");
+  assert.strictEqual(M.parseRcloneProgress(chunk).bytes, 400000);
+});
+
+test("parseRcloneProgress survives partial/garbage lines", () => {
+  assert.strictEqual(M.parseRcloneProgress('{"incomplete'), null);
+  assert.strictEqual(M.parseRcloneProgress("plain text"), null);
+  assert.strictEqual(M.parseRcloneProgress(""), null);
+  assert.strictEqual(M.parseRcloneProgress('{"level":"info","msg":"no stats"}'), null);
+  // a good line followed by a truncated one still yields the good one
+  assert.strictEqual(M.parseRcloneProgress(REAL_STATS_LINE + '\n{"trunc').bytes, 200000);
+});
+
+test("parseRcloneProgress leaves fraction null without a total", () => {
+  const p = M.parseRcloneProgress('{"stats":{"bytes":50,"totalBytes":0}}');
+  assert.strictEqual(p.fraction, null);
+  assert.strictEqual(p.totalBytes, null);
+});
+
+test("parseRcloneProgress clamps a fraction above 1", () => {
+  const p = M.parseRcloneProgress('{"stats":{"bytes":500,"totalBytes":100}}');
+  assert.strictEqual(p.fraction, 1);
+});
+
+test("formatSpeed and formatEta", () => {
+  assert.strictEqual(M.formatSpeed(1048576), "1.00 MiB/s");
+  assert.strictEqual(M.formatSpeed(0), "");
+  assert.strictEqual(M.formatSpeed(null), "");
+  assert.strictEqual(M.formatEta(30), "30s left");
+  assert.strictEqual(M.formatEta(120), "2m left");
+  assert.strictEqual(M.formatEta(7200), "2h left");
+  assert.strictEqual(M.formatEta(null), "");
+});

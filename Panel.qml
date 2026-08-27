@@ -194,6 +194,11 @@ Panel {
     if (e && !e.dir) filen.download(e, andOpen === true)
   }
 
+  function cancelSelectedTransfer() {
+    var t = selectedTransfer()
+    if (t && t.state === "running") filen.cancelTransfer(t.id)
+  }
+
   function requestDeleteSelected() {
     var e = selectedEntry()
     if (!e) return
@@ -244,6 +249,21 @@ Panel {
   function cancelNewFolder() {
     newFolderOpen = false
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // "62% · 11.4 MiB/s · 8s left" — whatever rclone has told us so far.
+  function transferProgressLine(t) {
+    if (!t) return ""
+    var verb = t.kind === "download" ? "Downloading" : "Uploading"
+    var bits = []
+    if (t.fraction !== undefined && t.fraction !== null)
+      bits.push(Math.round(t.fraction * 100) + "%")
+    else if (t.bytes) bits.push(Model.formatSize(t.bytes))
+    var sp = Model.formatSpeed(t.speed)
+    if (sp !== "") bits.push(sp)
+    var eta = Model.formatEta(t.eta)
+    if (eta !== "") bits.push(eta)
+    return bits.length === 0 ? verb + "\u2026" : bits.join(" \u00b7 ")
   }
 
   function toggleView() {
@@ -305,6 +325,7 @@ Panel {
   Service {
     id: filen
     settings: root.settings
+    panelOpen: root.opened
     onEntriesUpdated: {
       // Restore the cursor: prefer the folder we just stepped out of, else
       // whatever row we were on last time we were in this folder.
@@ -372,7 +393,12 @@ Panel {
       for (var i = 0; i < filen.transfers.length; i++) {
         var t = filen.transfers[i]
         out.push({ kind: t.kind, label: t.label, state: t.state,
-                   error: t.error, local: t.localPath, remote: t.remotePath })
+                   error: t.error, local: t.localPath, remote: t.remotePath,
+                   bytes: t.bytes === undefined ? null : t.bytes,
+                   totalBytes: t.totalBytes === undefined ? null : t.totalBytes,
+                   fraction: t.fraction === undefined ? null : t.fraction,
+                   speed: t.speed === undefined ? null : t.speed,
+                   line: root.transferProgressLine(t) })
       }
       return JSON.stringify(out)
     }
@@ -398,6 +424,19 @@ Panel {
       if (!e) return "no-selection"
       filen.download(e, false)
       return e.display
+    }
+
+    // Cancel the first running transfer. Deterministic entry point for tests
+    // and for `omarchy-shell filen cancel` from a script.
+    function cancel(): string {
+      for (var i = 0; i < filen.transfers.length; i++) {
+        var t = filen.transfers[i]
+        if (t.state === "running") {
+          filen.cancelTransfer(t.id)
+          return "canceling " + t.label
+        }
+      }
+      return "nothing-running"
     }
 
     function status(): string {
@@ -490,7 +529,13 @@ Panel {
       }
       onActivateRequested: if (root.cursorActive) root.activateCursor()
       onCloseRequested: root.dismiss()
-      onDeleteRequested: if (root.cursorActive && root.ready) root.requestDeleteSelected()
+      // `x` is the shell's shared "destructive action" key. In the browser it
+      // means delete; in the transfers list it means cancel this transfer.
+      onDeleteRequested: {
+        if (!root.cursorActive) return
+        if (root.view === "transfers") root.cancelSelectedTransfer()
+        else if (root.ready) root.requestDeleteSelected()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         var k = t.toLowerCase()
@@ -1050,8 +1095,14 @@ Panel {
                   required property var modelData
                   required property int index
 
+                  // A running transfer grows to fit its progress bar; a
+                  // finished one stays at the standard row height. Without
+                  // this the bar overlaps the next row.
+                  readonly property bool showsBar: modelData.state === "running"
+                    && modelData.fraction !== undefined && modelData.fraction !== null
+
                   width: transferColumn.width
-                  implicitHeight: Style.spacing.popupRowHeight
+                  implicitHeight: Style.spacing.popupRowHeight + (showsBar ? Style.space(8) : 0)
                   foreground: root.foreground
                   hasCursor: root.cursorActive && root.focusSection === "transfers" && root.transferIndex === index
 
@@ -1112,10 +1163,11 @@ Panel {
                         font.pixelSize: Style.font.body
                         elide: Text.ElideMiddle
                       }
+
                       Text {
                         width: parent.width
                         text: modelData.state === "failed" ? modelData.error
-                            : modelData.state === "running" ? (modelData.kind === "download" ? "Downloading\u2026" : "Uploading\u2026")
+                            : modelData.state === "running" ? root.transferProgressLine(modelData)
                             : modelData.state === "canceled" ? "Canceled"
                             : Model.relativeTime(modelData.startedMs, Date.now())
                         textFormat: Text.PlainText
@@ -1123,6 +1175,29 @@ Panel {
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
+                      }
+
+                      // Determinate bar once rclone reports a total; before
+                      // that the pulsing glyph is the only progress signal.
+                      // The row's implicitHeight accounts for this (showsBar).
+                      Item {
+                        width: parent.width
+                        height: transferRow.showsBar ? Style.space(7) : 0
+                        visible: transferRow.showsBar
+
+                        Rectangle {
+                          anchors.verticalCenter: parent.verticalCenter
+                          width: parent.width
+                          height: Math.max(2, Style.space(2))
+                          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
+
+                          Rectangle {
+                            width: parent.width * (modelData.fraction || 0)
+                            height: parent.height
+                            color: Color.accent
+                            Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                          }
+                        }
                       }
                     }
 

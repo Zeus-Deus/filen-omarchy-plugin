@@ -48,6 +48,10 @@ Item {
 
   property var settings: ({})
 
+  // Set by the panel so completion toasts are suppressed while the user is
+  // already looking at the transfer list.
+  property bool panelOpen: false
+
   // ── availability / auth ────────────────────────────────────────────────
   property bool cliChecked: false
   property bool cliInstalled: false
@@ -75,6 +79,8 @@ Item {
   // ── transfers ──────────────────────────────────────────────────────────
   property var transfers: []
   property int transferSeq: 0
+  // id -> live Process handle, so cancel always finds its target.
+  property var liveProcesses: ({})
 
   // ── transient feedback ─────────────────────────────────────────────────
   property string actionStatus: ""
@@ -133,6 +139,20 @@ Item {
   // element, so no quoting or interpolation is involved.
   function rcloneArgs(args) {
     return cliArgs(["rclone"].concat(args))
+  }
+
+  // Transfer invocations additionally ask rclone for machine-readable
+  // progress: one JSON object per line on stderr, once per second.
+  function rcloneTransferArgs(args) {
+    var extra = [
+      "--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE"
+    ]
+    // Optional bandwidth cap. Empty/0 means unlimited (rclone's default).
+    var limit = String(setting("bandwidthLimit", "")).trim()
+    if (limit !== "" && /^[0-9]+(\.[0-9]+)?[KMG]?$/.test(limit)) {
+      extra.push("--bwlimit", limit)
+    }
+    return rcloneArgs(args.concat(extra))
   }
 
   function remoteUrl(path) {
@@ -270,11 +290,11 @@ Item {
     if (entry.dir) {
       // `copy` places the source's CONTENTS into dest, so name the dest after
       // the (sanitized) folder to reproduce the remote structure.
-      startTransfer(id, rcloneArgs(["copy", remoteUrl(remote), local]))
+      startTransfer(id, rcloneTransferArgs(["copy", remoteUrl(remote), local]))
     } else {
       // `copyto` writes exactly one destination path, which is what lets us
       // choose the sanitized local filename instead of inheriting the remote.
-      startTransfer(id, rcloneArgs(["copyto", remoteUrl(remote), local]))
+      startTransfer(id, rcloneTransferArgs(["copyto", remoteUrl(remote), local]))
     }
   }
 
@@ -289,12 +309,23 @@ Item {
     // copyto preserves the exact destination name for a single file.
     var destRemote = Model.joinPath(currentPath, name)
     if (destRemote === null) { finishTransfer(id, 1, "Unsupported name"); return }
-    startTransfer(id, rcloneArgs(["copyto", p, remoteUrl(destRemote)]))
+    startTransfer(id, rcloneTransferArgs(["copyto", p, remoteUrl(destRemote)]))
   }
 
   function startTransfer(id, argv) {
-    var proc = transferComponent.createObject(root, { transferId: id, argv: argv })
+    // `filen rclone ...` forks a separate rclone binary as its child, and both
+    // inherit the SHELL's process group — so signalling just the `filen` pid
+    // leaves rclone running, and group-killing our own group would take the
+    // shell down with it. `setsid` puts each transfer in its own session and
+    // process group, so cancel can signal the whole group safely.
+    var wrapped = ["setsid"].concat(argv)
+    var proc = transferComponent.createObject(root, { transferId: id, argv: wrapped })
     if (!proc) { finishTransfer(id, 1, "Could not start transfer"); return }
+    // Keep an explicit handle: scanning root.children for the process is
+    // fragile (ordering, destruction timing), and cancel must never miss.
+    var reg = liveProcesses
+    reg[id] = proc
+    liveProcesses = reg
     proc.running = true
   }
 
@@ -325,36 +356,84 @@ Item {
   }
 
   function finishTransfer(id, exitCode, output) {
+    var prev = null
+    for (var i = 0; i < transfers.length; i++) if (transfers[i].id === id) prev = transfers[i]
     var ok = exitCode === 0
-    var canceled = exitCode === 143 || exitCode === 130 || exitCode === -15
+    // A group kill surfaces as several different codes depending on which
+    // process died first, so trust our own intent flag over the exit code.
+    var canceled = (prev && prev.canceling === true)
+      || exitCode === 143 || exitCode === 130 || exitCode === -15 || exitCode === 137
     var t = updateTransfer(id, {
       state: ok ? "done" : (canceled ? "canceled" : "failed"),
-      error: ok ? "" : Model.errorMessage(exitCode, output)
+      error: ok || canceled ? "" : Model.errorMessage(exitCode, output),
+      canceling: false
     })
-    if (!ok && Model.isAuthError(output)) { signedIn = false; authChecked = true }
+    cancelKillTimer.pending = 0
+    if (!ok && !canceled && Model.isAuthError(output)) { signedIn = false; authChecked = true }
     if (!t) return
     if (ok) {
       if (t.kind === "download") {
         showStatus("Downloaded " + t.label)
         if (t.openWhenDone && !t.isDir) openLocal(t.localPath)
+        // Only notify when the panel is closed — a toast on top of the panel
+        // you are already looking at is noise.
+        if (!panelOpen) notify("Download finished", t.label)
       } else {
         showStatus("Uploaded " + t.label)
         list(currentPath, true)
         refreshQuota()
+        if (!panelOpen) notify("Upload finished", t.label)
       }
       transferFinished(t.kind, t.label, true)
     } else if (!canceled) {
       showError(t.error)
+      notify(t.kind === "download" ? "Download failed" : "Upload failed",
+             t.label + " \u2014 " + t.error)
       transferFinished(t.kind, t.label, false)
     }
   }
 
+  // Desktop notification through the shell's own notification service.
+  // Body text is CLI-derived, so it is sanitized and passed as a positional
+  // argument, never interpolated into a command string.
+  function notify(title, body) {
+    var t = Model.sanitizeText(title, 60)
+    var b = Model.sanitizeText(body, 160)
+    if (t === "") return
+    Quickshell.execDetached(["notify-send", "-a", "Filen", "-i", "folder-remote", "--", t, b])
+  }
+
   function cancelTransfer(id) {
-    var kids = root.children
-    for (var i = 0; i < kids.length; i++) {
-      var k = kids[i]
-      if (k && k.transferId === id && k.running) { k.signal(15); return }
+    var proc = liveProcesses[id]
+    if (!proc) return
+    // Mark intent first: the exit code from a group kill is not reliably
+    // distinguishable from a genuine failure.
+    updateTransfer(id, { canceling: true })
+    // setsid made this process a group leader, so its pid IS the group id.
+    // Negative pid = "whole group", which reaches the rclone child too.
+    // SIGTERM first so rclone removes its partial file.
+    if (proc.processId > 0) {
+      Quickshell.execDetached(["kill", "-TERM", "--", "-" + proc.processId])
+      cancelKillTimer.pending = proc.processId
+      cancelKillTimer.restart()
     }
+    try { proc.signal(15) } catch (e) { /* already gone */ }
+  }
+
+  // If a transfer ignores SIGTERM, follow up with SIGKILL on the group.
+  Timer {
+    id: cancelKillTimer
+    property int pending: 0
+    interval: 3000
+    onTriggered: {
+      if (pending > 0) Quickshell.execDetached(["kill", "-KILL", "--", "-" + pending])
+      pending = 0
+    }
+  }
+
+  function forgetProcess(id) {
+    var reg = liveProcesses
+    if (reg[id] !== undefined) { delete reg[id]; liveProcesses = reg }
   }
 
   function clearFinishedTransfers() {
@@ -597,17 +676,40 @@ Item {
   }
 
   // One Process per transfer so several can run concurrently.
+  //
+  // Progress: rclone writes one JSON stats object per second to stderr. We
+  // read it with SplitParser (line-delimited) rather than StdioCollector so
+  // the panel updates DURING the transfer instead of only at exit. stdout is
+  // still collected whole for the failure message.
   Component {
     id: transferComponent
     Process {
+      id: xfer
       property string transferId: ""
       property var argv: []
+      property string tailErr: ""
       running: false
       command: argv
+
       stdout: StdioCollector { id: xferOut; waitForEnd: true }
-      stderr: StdioCollector { id: xferErr; waitForEnd: true }
+
+      stderr: SplitParser {
+        splitMarker: "\n"
+        onRead: function(line) {
+          // Keep a bounded tail for diagnosing a failure at exit.
+          if (xfer.tailErr.length < Model.MAX_STDERR_BYTES) xfer.tailErr += line + "\n"
+          var p = Model.parseRcloneProgress(line)
+          if (p) root.updateTransfer(xfer.transferId, {
+            bytes: p.bytes, totalBytes: p.totalBytes,
+            speed: p.speed, eta: p.eta, fraction: p.fraction
+          })
+        }
+      }
+
       onExited: function(exitCode) {
-        root.finishTransfer(transferId, exitCode, root.combinedOutput(xferOut.text, xferErr.text))
+        root.forgetProcess(transferId)
+        root.finishTransfer(transferId, exitCode,
+                            root.combinedOutput(xferOut.text, xfer.tailErr))
         destroy()
       }
     }

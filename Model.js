@@ -233,6 +233,56 @@ function parseAbout(text) {
   return { used: used, total: total, free: toNumber(d.free) };
 }
 
+// ---------------------------------------------------------------- progress
+
+// rclone with `--use-json-log --stats 1s --stats-log-level NOTICE` writes one
+// JSON object per line to stderr, each carrying a `stats` block:
+//   {"level":"notice","msg":"...","stats":{"bytes":N,"totalBytes":N,
+//    "speed":N,"eta":N|null,"transfers":N,"errors":N,...}}
+// Lines are parsed individually so a partial trailing line (we read a live
+// stream) can never break the parse. Returns the LAST usable stats block.
+function parseRcloneProgress(chunk) {
+  var text = String(chunk || "");
+  if (text.length > MAX_RESPONSE_BYTES) text = text.slice(-MAX_RESPONSE_BYTES);
+  var lines = text.split("\n");
+  var latest = null;
+  for (var i = lines.length - 1; i >= 0; i--) {
+    var line = lines[i];
+    if (line.length < 2 || line.charAt(0) !== "{") continue;
+    var obj = parseJson(line);
+    if (!obj || typeof obj !== "object" || !obj.stats) continue;
+    var s = obj.stats;
+    var bytes = toNumber(s.bytes);
+    var total = toNumber(s.totalBytes);
+    if (bytes === null) continue;
+    latest = {
+      bytes: bytes,
+      totalBytes: total === null || total <= 0 ? null : total,
+      speed: toNumber(s.speed),
+      eta: toNumber(s.eta),
+      errors: toNumber(s.errors) || 0,
+      fraction: (total !== null && total > 0)
+        ? Math.max(0, Math.min(1, bytes / total)) : null
+    };
+    break;
+  }
+  return latest;
+}
+
+function formatSpeed(bytesPerSec) {
+  var n = Number(bytesPerSec);
+  if (!isFinite(n) || n <= 0) return "";
+  return formatSize(n) + "/s";
+}
+
+function formatEta(seconds) {
+  var n = Number(seconds);
+  if (!isFinite(n) || n <= 0) return "";
+  if (n < 60) return Math.round(n) + "s left";
+  if (n < 3600) return Math.round(n / 60) + "m left";
+  return Math.round(n / 3600) + "h left";
+}
+
 // ---------------------------------------------------------------- file kinds
 
 var IMAGE_EXT = ["png","jpg","jpeg","gif","webp","bmp","avif","jxl","tiff","tif","ico","svg"];
@@ -503,6 +553,9 @@ if (typeof module !== "undefined" && module.exports) {
     parseLsJson: parseLsJson,
     parseRfc3339: parseRfc3339,
     parseAbout: parseAbout,
+    parseRcloneProgress: parseRcloneProgress,
+    formatSpeed: formatSpeed,
+    formatEta: formatEta,
     extensionOf: extensionOf,
     kindOf: kindOf,
     iconFor: iconFor,

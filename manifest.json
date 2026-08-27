@@ -17,7 +17,8 @@
     "defaults": {
       "refreshIntervalSec": 300,
       "downloadDir": "",
-      "confirmDelete": true
+      "confirmDelete": true,
+      "bandwidthLimit": ""
     },
     "schema": [
       {
@@ -43,6 +44,13 @@
         "label": "Confirm before deleting",
         "description": "Ask before moving an item to the Filen trash. Strongly recommended.",
         "defaultValue": true
+      },
+      {
+        "key": "bandwidthLimit",
+        "type": "string",
+        "label": "Bandwidth limit",
+        "description": "Cap transfer speed, e.g. 2M or 500K. Leave empty for unlimited.",
+        "defaultValue": ""
       }
     ]
   }
