@@ -879,7 +879,12 @@ Panel {
               color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
 
               Rectangle {
-                width: parent.width * filen.quotaFraction
+                // Keep a hairline of fill visible at tiny percentages, so an
+                // almost-empty drive reads as "0.5% used" rather than as a
+                // broken/empty widget.
+                width: filen.quotaFraction > 0
+                  ? Math.max(Style.space(2), parent.width * filen.quotaFraction)
+                  : 0
                 height: parent.height
                 color: filen.quotaHigh ? root.urgent : Color.accent
                 Behavior on width { NumberAnimation { duration: 240; easing.type: Easing.OutCubic } }
@@ -1288,16 +1293,35 @@ Panel {
           }
 
           // ── keyboard hints ─────────────────────────────────────────────
-          Text {
+          // Grouped onto two deliberate lines rather than one long wrapping
+          // string: word-wrap used to split mid-phrase ("u / upload"), which
+          // reads as noise.
+          Column {
             visible: root.ready
             width: parent.width
-            text: root.view === "transfers"
-              ? "\u21c5 move  \u00b7  enter open  \u00b7  x cancel  \u00b7  c clear  \u00b7  t files"
-              : "\u21c5 move  \u00b7  \u2192 enter  \u00b7  \u2190 up  \u00b7  o open  \u00b7  d download  \u00b7  u upload  \u00b7  p paste  \u00b7  / filter  \u00b7  n new  \u00b7  y copy path  \u00b7  x delete  \u00b7  t transfers"
-            color: Qt.darker(root.foreground, 2.4)
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            spacing: Style.space(2)
+
+            Text {
+              width: parent.width
+              text: root.view === "transfers"
+                ? "\u21c5 move   \u00b7   \u21b5 open   \u00b7   x cancel"
+                : "\u21c5 move   \u00b7   \u2192 enter   \u00b7   \u2190 up   \u00b7   \u21b5 open   \u00b7   d download"
+              color: Qt.darker(root.foreground, 2.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Text {
+              width: parent.width
+              text: root.view === "transfers"
+                ? "c clear   \u00b7   t files   \u00b7   r refresh"
+                : "u upload  \u00b7  p paste  \u00b7  / filter  \u00b7  n new  \u00b7  x delete  \u00b7  t transfers"
+              color: Qt.darker(root.foreground, 2.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
           }
         }
       }
