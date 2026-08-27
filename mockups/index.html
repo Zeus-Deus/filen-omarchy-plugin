@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Filen for Omarchy — plugin design</title>
+<style>
+  /* Real tokens from the live machine:
+     theme        spiderman  (colors.toml)
+     font         JetBrainsMono Nerd Font
+     bar height   26px  (Style.bar.sizeHorizontal, base-size 12)
+     radius       0     (hyprctl decoration:rounding)
+     panel pad    18px  (Style.spacing.panelPadding)
+     row height   28px  (Style.spacing.popupRowHeight) */
+  :root{
+    --fg:#FEFEFE; --bg:#000000; --accent:#ab6383; --urgent:#c47d78;
+    --muted:#686163; --dim:#a4a4a4;
+    --green:#f8ab7c; --yellow:#ffd2a4; --cyan:#ffc36b; --magenta:#e9889a;
+    --panel:#0a0a0a; --line:rgba(254,254,254,.16);
+    --fill-normal:rgba(254,254,254,.04);
+    --fill-hover:rgba(254,254,254,.08);
+    --fill-sel:rgba(254,254,254,.18);
+    --radius:0px;
+    --mono:"JetBrainsMono Nerd Font","JetBrains Mono",ui-monospace,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#050505;color:var(--fg);font-family:var(--mono);font-size:13px;line-height:1.55;
+       background-image:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(171,99,131,.13),transparent 60%);}
+  .wrap{max-width:1180px;margin:0 auto;padding:56px 28px 120px}
+  h1{font-size:30px;font-weight:700;letter-spacing:-.02em;margin:0 0 6px}
+  h1 .thin{color:var(--muted);font-weight:400}
+  .sub{color:var(--dim);max-width:70ch;margin:0 0 8px}
+  .meta{color:var(--muted);font-size:11px;margin-bottom:44px}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.18em;color:var(--accent);
+     margin:64px 0 6px;font-weight:700}
+  h2 .n{color:var(--muted)}
+  .lead{color:var(--dim);max-width:78ch;margin:0 0 22px}
+  .note{border-left:2px solid var(--accent);padding:10px 0 10px 16px;margin:22px 0;color:var(--dim);background:rgba(171,99,131,.05)}
+  .note b{color:var(--fg)}
+  .warn{border-left-color:var(--urgent);background:rgba(196,125,120,.06)}
+  code{background:rgba(254,254,254,.07);padding:1px 5px;font-size:12px;color:var(--yellow)}
+
+  /* ---------- desktop frame ---------- */
+  .screen{border:1px solid var(--line);background:
+      linear-gradient(160deg,#160b10 0%,#0a0508 45%,#000 100%);
+      padding:0;position:relative;overflow:hidden;margin:20px 0 8px}
+  .caption{color:var(--muted);font-size:11px;margin:0 0 26px}
+
+  /* ---------- the bar ---------- */
+  .bar{height:26px;background:var(--bg);display:flex;align-items:center;
+       font-size:12px;border-bottom:1px solid rgba(254,254,254,.07);position:relative;z-index:5}
+  .bar .sec{display:flex;align-items:center;height:100%}
+  .bar .left{padding-left:2px}
+  .bar .center{position:absolute;left:50%;transform:translateX(-50%)}
+  .bar .right{margin-left:auto;padding-right:2px}
+  .slot{height:27px;min-width:27px;display:flex;align-items:center;justify-content:center;
+        gap:5px;padding:0 7px;color:var(--fg);position:relative}
+  .slot.dim{color:var(--muted)}
+  .slot.hot{background:var(--fill-hover)}
+  .slot.sel{background:var(--fill-sel)}
+  .ws{display:flex;gap:3px;padding:0 6px}
+  .ws i{width:7px;height:7px;background:var(--muted);display:block;font-style:normal}
+  .ws i.on{background:var(--fg)}
+  .ws i.has{background:var(--accent)}
+  .badge{font-size:10px;color:var(--bg);background:var(--fg);padding:0 3px;line-height:13px}
+  .badge.acc{background:var(--accent);color:#fff}
+  .badge.warn{background:var(--urgent);color:#000}
+
+  /* filen glyph, drawn not imported */
+  .fglyph{width:16px;height:16px;display:block}
+
+  /* ---------- panel ---------- */
+  .panelwrap{padding:5px 0 0;display:flex;justify-content:flex-end;padding-right:8px;
+             min-height:430px;align-items:flex-start;background:transparent;position:relative}
+  .panelwrap.mid{justify-content:center}
+  .panel{width:400px;background:var(--panel);border:1px solid var(--line);
+         border-radius:var(--radius);padding:18px;box-shadow:0 18px 50px rgba(0,0,0,.75)}
+  .panel.wide{width:470px}
+
+  .hero{display:flex;align-items:flex-start;gap:12px;margin-bottom:4px}
+  .hero .ico{flex:0 0 auto;padding-top:2px}
+  .hero .txt{flex:1;min-width:0}
+  .hero .title{font-size:14px;font-weight:700;display:flex;align-items:center;gap:8px}
+  .hero .metaline{color:var(--muted);font-size:11px;margin-top:1px}
+  .hero .act{display:flex;gap:2px;margin-left:auto}
+  .iconbtn{width:24px;height:24px;display:flex;align-items:center;justify-content:center;
+           color:var(--dim);border:1px solid transparent;font-size:12px}
+  .iconbtn.hot{background:var(--fill-hover);border-color:rgba(254,254,254,.25);color:var(--fg)}
+
+  .sep{height:1px;background:var(--line);margin:14px -18px}
+  .secthead{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+            margin:0 0 8px;display:flex;align-items:center;gap:8px}
+  .secthead .rest{flex:1;height:1px;background:var(--line)}
+
+  /* quota meter */
+  .quota{margin:12px 0 2px}
+  .quota .nums{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);margin-bottom:5px}
+  .quota .nums b{color:var(--fg);font-weight:600}
+  .meter{height:4px;background:rgba(254,254,254,.10);position:relative;overflow:hidden}
+  .meter span{display:block;height:100%;background:var(--accent)}
+  .meter.hi span{background:var(--urgent)}
+
+  /* rows */
+  .row{display:flex;align-items:center;gap:10px;height:28px;padding:0 8px;margin:0 -8px;
+       font-size:12px;color:var(--fg);position:relative}
+  .row.cursor{background:var(--fill-hover);box-shadow:inset 2px 0 0 var(--accent)}
+  .row .ic{width:14px;text-align:center;color:var(--muted);flex:0 0 14px}
+  .row .ic.dir{color:var(--accent)}
+  .row .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .row .sz{color:var(--muted);font-size:11px;flex:0 0 auto}
+  .row .rt{display:flex;gap:1px;margin-left:6px;opacity:0}
+  .row.cursor .rt{opacity:1}
+  .row .star{color:var(--yellow)}
+  .row.busy .nm{color:var(--muted)}
+
+  /* breadcrumb */
+  .crumb{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);
+         margin:0 0 10px;overflow:hidden;white-space:nowrap}
+  .crumb a{color:var(--dim);text-decoration:none}
+  .crumb .cur{color:var(--fg)}
+  .crumb .sl{color:rgba(254,254,254,.22)}
+
+  /* search field */
+  .field{display:flex;align-items:center;gap:8px;height:28px;padding:0 10px;
+         background:var(--fill-normal);border:1px solid rgba(254,254,254,.4);margin-bottom:12px}
+  .field.focus{border-color:var(--accent);background:var(--fill-hover)}
+  .field .ph{color:var(--muted)}
+  .field .caret{width:7px;height:14px;background:var(--fg);animation:bl 1.1s steps(1) infinite}
+  @keyframes bl{50%{opacity:0}}
+
+  /* mount / transfer cards */
+  .card{border:1px solid var(--line);padding:11px 12px;margin-bottom:8px;background:var(--fill-normal)}
+  .card.on{border-color:rgba(171,99,131,.55);background:rgba(171,99,131,.07)}
+  .card .top{display:flex;align-items:center;gap:9px;font-size:12px}
+  .card .top .lbl{font-weight:600}
+  .card .top .st{margin-left:auto;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+  .card .top .st.live{color:var(--green)}
+  .card .path{color:var(--muted);font-size:11px;margin-top:3px;
+              overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .toggle{width:30px;height:16px;background:rgba(254,254,254,.14);position:relative;flex:0 0 30px}
+  .toggle i{position:absolute;top:2px;left:2px;width:12px;height:12px;background:var(--muted);display:block}
+  .toggle.on{background:rgba(171,99,131,.4)}
+  .toggle.on i{left:16px;background:var(--accent)}
+
+  .prog{height:3px;background:rgba(254,254,254,.10);margin-top:8px;overflow:hidden}
+  .prog span{display:block;height:100%;background:var(--green)}
+
+  /* footer hints */
+  .hints{display:flex;flex-wrap:wrap;gap:4px 12px;color:var(--muted);font-size:10px;margin-top:14px;
+         padding-top:12px;border-top:1px solid var(--line)}
+  .hints b{color:var(--dim);background:rgba(254,254,254,.07);padding:0 4px;font-weight:400}
+
+  /* empty / locked states */
+  .lock{text-align:center;padding:22px 8px 14px}
+  .lock .big{font-size:22px;margin-bottom:10px;color:var(--accent)}
+  .lock .h{font-size:13px;font-weight:600;margin-bottom:5px}
+  .lock .p{color:var(--muted);font-size:11px;max-width:34ch;margin:0 auto 14px;line-height:1.6}
+  .btn{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 14px;font-size:12px;
+       border:1px solid rgba(254,254,254,.4);background:var(--fill-normal);color:var(--fg)}
+  .btn.primary{border-color:var(--accent);background:rgba(171,99,131,.16)}
+  .cmdline{background:#000;border:1px solid var(--line);padding:8px 10px;margin:12px 0 0;
+           font-size:11px;color:var(--green);text-align:left;overflow-x:auto;white-space:nowrap}
+  .cmdline .p{color:var(--muted)}
+
+  /* toast / OSD */
+  .osd{width:270px;background:var(--panel);border:1px solid var(--line);padding:12px 14px;
+       box-shadow:0 14px 40px rgba(0,0,0,.8)}
+  .osd .t{font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .osd .b{color:var(--muted);font-size:11px;margin-top:3px}
+
+  /* tables */
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:12px}
+  th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);
+     padding:0 12px 8px 0;border-bottom:1px solid var(--line);font-weight:700;vertical-align:bottom}
+  td{padding:8px 12px 8px 0;border-bottom:1px solid rgba(254,254,254,.06);vertical-align:top;color:var(--dim)}
+  td:first-child{color:var(--fg);white-space:nowrap}
+  td b{color:var(--fg);font-weight:600}
+  .yes{color:var(--green)} .no{color:var(--urgent)} .maybe{color:var(--yellow)}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  @media(max-width:900px){.grid2{grid-template-columns:1fr}}
+  .flow{display:flex;flex-wrap:wrap;gap:10px;align-items:center;color:var(--muted);font-size:11px;margin:14px 0}
+  .flow .n{border:1px solid var(--line);padding:6px 11px;color:var(--fg);background:var(--fill-normal)}
+  .flow .ar{color:var(--accent)}
+  ul{padding-left:18px;color:var(--dim)} li{margin:5px 0}
+  li b{color:var(--fg)}
+  .tag{display:inline-block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+       padding:1px 7px;border:1px solid var(--line);color:var(--muted);margin-left:8px;vertical-align:middle}
+  .tag.v1{border-color:rgba(248,171,124,.5);color:var(--green)}
+  .tag.v2{border-color:rgba(255,210,164,.5);color:var(--yellow)}
+  .tag.later{border-color:rgba(104,97,99,.7)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Filen <span class="thin">for Omarchy Quattro</span></h1>
+<p class="sub">A bar widget + panel that puts your end-to-end encrypted drive one keypress away — browse, search, transfer, mount, and share without opening a browser or memorising a CLI.</p>
+<p class="meta">Design study · rendered against the live machine: Omarchy 4.0.0 · theme <b>spiderman</b> · JetBrainsMono Nerd Font · bar 26px · radius 0</p>
+
+<!-- ============================================================ -->
+<h2><span class="n">01 ·</span> Where it lives</h2>
+<p class="lead">One <code>bar-widget</code> in the right section, next to tailscale and gazelle. The glyph shows drive state at a glance; the count badge is the number of active transfers. Everything else is behind one click or <code>Super+F</code>.</p>
+
+<div class="screen">
+  <div class="bar">
+    <div class="sec left">
+      <div class="slot">󰣇</div>
+      <div class="ws"><i class="on"></i><i class="has"></i><i></i><i></i><i></i></div>
+    </div>
+    <div class="sec center">
+      <div class="slot dim">󰛨</div>
+      <div class="slot">Thursday 18:42</div>
+      <div class="slot dim">us</div>
+      <div class="slot dim">󰖐 14°</div>
+    </div>
+    <div class="sec right">
+      <div class="slot dim">󰋊</div>
+      <div class="slot dim">P</div>
+      <div class="slot dim">󰹹</div>
+      <div class="slot sel">
+        <svg class="fglyph" viewBox="0 0 16 16" fill="none">
+          <path d="M3 2.4h6.1L13 6.1V13.6H3z" stroke="#FEFEFE" stroke-width="1.2"/>
+          <path d="M9 2.4V6.1H13" stroke="#FEFEFE" stroke-width="1.2"/>
+          <path d="M6.1 9.1h3.8M6.1 11.2h2.6" stroke="#ab6383" stroke-width="1.2"/>
+        </svg>
+        <span class="badge acc">2</span>
+      </div>
+      <div class="slot dim">󰖩</div>
+      <div class="slot dim">󰕾</div>
+      <div class="slot dim">󰁹</div>
+    </div>
+  </div>
+  <div class="panelwrap">
+    <div class="panel">
+
+      <div class="hero">
+        <div class="ico">
+          <svg width="26" height="26" viewBox="0 0 16 16" fill="none">
+            <path d="M3 2.4h6.1L13 6.1V13.6H3z" stroke="#FEFEFE" stroke-width="1.1"/>
+            <path d="M9 2.4V6.1H13" stroke="#FEFEFE" stroke-width="1.1"/>
+            <path d="M6.1 9.1h3.8M6.1 11.2h2.6" stroke="#ab6383" stroke-width="1.1"/>
+          </svg>
+        </div>
+        <div class="txt">
+          <div class="title">Filen</div>
+          <div class="metaline">you@… · 2 transfers · synced 3m ago</div>
+        </div>
+        <div class="act">
+          <div class="iconbtn hot" title="Refresh">󰑐</div>
+          <div class="iconbtn" title="Open web drive">󰏋</div>
+        </div>
+      </div>
+
+      <div class="quota">
+        <div class="nums"><span>Drive</span><span><b>412.6 GiB</b> of 1 TiB</span></div>
+        <div class="meter"><span style="width:41%"></span></div>
+      </div>
+
+      <div class="sep"></div>
+
+      <div class="crumb">
+        <a>/</a><span class="sl">›</span><a>Documents</a><span class="sl">›</span><span class="cur">Invoices</span>
+      </div>
+
+      <div class="row"><span class="ic dir">󰉋</span><span class="nm">2026-Q1</span><span class="sz">—</span></div>
+      <div class="row"><span class="ic dir">󰉋</span><span class="nm">2026-Q2</span><span class="sz">—</span></div>
+      <div class="row cursor">
+        <span class="ic">󰈙</span><span class="nm">invoice-0184.pdf</span><span class="sz">248 KiB</span>
+        <span class="rt">
+          <span class="iconbtn hot" title="Download">󰇚</span>
+          <span class="iconbtn" title="Public link">󰌷</span>
+          <span class="iconbtn" title="Favorite">󰓎</span>
+        </span>
+      </div>
+      <div class="row"><span class="ic">󰈙</span><span class="nm">invoice-0185.pdf</span><span class="sz">251 KiB</span></div>
+      <div class="row"><span class="ic star">󰓎</span><span class="nm">tax-summary.xlsx</span><span class="sz">1.2 MiB</span></div>
+      <div class="row busy"><span class="ic">󰇚</span><span class="nm">receipts.zip — 62%</span><span class="sz">18.4 MiB</span></div>
+
+      <div class="hints">
+        <span><b>↑↓</b> move</span><span><b>→</b> enter</span><span><b>←</b> up</span>
+        <span><b>⏎</b> download</span><span><b>/</b> search</span><span><b>l</b> link</span>
+        <span><b>u</b> upload</span><span><b>f</b> favorite</span><span><b>m</b> mounts</span>
+      </div>
+
+    </div>
+  </div>
+</div>
+<p class="caption">Default view — the browser. Cursor row shows its actions inline; everything reachable by keyboard, mouse optional.</p>
+
+<!-- ============================================================ -->
+<h2><span class="n">02 ·</span> The four states you actually hit</h2>
+<p class="lead">Most plugin designs only draw the happy path. These are the other three, and they matter more — the first is what every new user sees.</p>
+
+<div class="grid2">
+
+  <div>
+    <div class="screen">
+      <div class="panelwrap mid" style="min-height:300px;padding-right:0">
+        <div class="panel" style="width:380px">
+          <div class="lock">
+            <div class="big">󰌾</div>
+            <div class="h">Not signed in</div>
+            <div class="p">Filen is end-to-end encrypted. The plugin never handles your password — the CLI logs in and stores the session in your system keyring.</div>
+            <a class="btn primary">󰆍 Open login in terminal</a>
+            <div class="cmdline"><span class="p">$</span> filen whoami</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="caption"><b>Locked.</b> No password field, ever. The button spawns a terminal running the CLI's own prompt.</p>
+  </div>
+
+  <div>
+    <div class="screen">
+      <div class="panelwrap mid" style="min-height:300px;padding-right:0">
+        <div class="panel" style="width:380px">
+          <div class="lock">
+            <div class="big" style="color:var(--urgent)">󰅚</div>
+            <div class="h">Filen CLI not installed</div>
+            <div class="p">This plugin drives the official Filen CLI. Nothing is bundled and nothing is downloaded for you — install it yourself, then reopen.</div>
+            <a class="btn">󰆒 Copy install command</a>
+            <div class="cmdline"><span class="p">$</span> curl -sL …/filen-cli/install.sh | bash</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="caption"><b>Missing dependency.</b> Copy, don't execute. The user reviews the script.</p>
+  </div>
+
+  <div>
+    <div class="screen">
+      <div class="panelwrap mid" style="min-height:300px;padding-right:0">
+        <div class="panel" style="width:380px">
+          <div class="field focus"><span>󰍉</span><span>invoice</span><span class="caret"></span></div>
+          <div class="secthead">Results <span class="rest"></span> <span style="color:var(--muted)">6</span></div>
+          <div class="row cursor"><span class="ic">󰈙</span><span class="nm">invoice-0184.pdf</span><span class="sz">248 KiB</span></div>
+          <div class="row"><span class="ic">󰈙</span><span class="nm">invoice-0185.pdf</span><span class="sz">251 KiB</span></div>
+          <div class="row"><span class="ic dir">󰉋</span><span class="nm">invoices-archive</span><span class="sz">—</span></div>
+          <div class="row"><span class="ic">󰈙</span><span class="nm">invoice-template.docx</span><span class="sz">34 KiB</span></div>
+          <div class="row"><span class="ic">󰈙</span><span class="nm">old-invoice-2024.pdf</span><span class="sz">190 KiB</span></div>
+          <div class="hints"><span><b>esc</b> back to browse</span><span><b>⏎</b> download</span><span><b>→</b> reveal in folder</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="caption"><b>Search.</b> Press <code>/</code> anywhere. Names are decrypted client-side; the query never leaves your machine in cleartext.</p>
+  </div>
+
+  <div>
+    <div class="screen">
+      <div class="panelwrap mid" style="min-height:300px;padding-right:0">
+        <div class="panel" style="width:380px">
+          <div class="hero" style="margin-bottom:14px">
+            <div class="txt"><div class="title">Mounts &amp; servers</div>
+            <div class="metaline">1 mount live · 0 servers</div></div>
+          </div>
+          <div class="card on">
+            <div class="top"><div class="toggle on"><i></i></div><span class="lbl">Network drive</span><span class="st live">mounted</span></div>
+            <div class="path">~/Filen · cache 4.2 GiB</div>
+          </div>
+          <div class="card">
+            <div class="top"><div class="toggle"><i></i></div><span class="lbl">WebDAV</span><span class="st">stopped</span></div>
+            <div class="path">127.0.0.1:8080 · loopback only · read-only</div>
+          </div>
+          <div class="card">
+            <div class="top"><div class="toggle"><i></i></div><span class="lbl">S3</span><span class="st">stopped</span></div>
+            <div class="path">127.0.0.1:8081 · loopback only</div>
+          </div>
+          <div class="hints"><span><b>space</b> toggle</span><span><b>e</b> edit</span><span><b>o</b> open in files</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="caption"><b>Mounts.</b> Servers default to loopback + read-only. Binding to 0.0.0.0 requires an explicit, warned edit.</p>
+  </div>
+
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">03 ·</span> Transfers, quietly</h2>
+<p class="lead">Uploads and downloads are the one thing that needs to be visible while the panel is closed. The bar badge counts them; a notification lands when the last one finishes.</p>
+
+<div class="screen">
+  <div class="bar">
+    <div class="sec left"><div class="slot">󰣇</div><div class="ws"><i class="on"></i><i class="has"></i><i></i><i></i><i></i></div></div>
+    <div class="sec center"><div class="slot">Thursday 18:44</div></div>
+    <div class="sec right">
+      <div class="slot dim">󰋊</div>
+      <div class="slot hot">
+        <svg class="fglyph" viewBox="0 0 16 16" fill="none">
+          <path d="M3 2.4h6.1L13 6.1V13.6H3z" stroke="#ab6383" stroke-width="1.2"/>
+          <path d="M9 2.4V6.1H13" stroke="#ab6383" stroke-width="1.2"/>
+          <path d="M8 8.4v3.4M6.3 10.1L8 11.8l1.7-1.7" stroke="#FEFEFE" stroke-width="1.2"/>
+        </svg>
+        <span class="badge acc">2</span>
+      </div>
+      <div class="slot dim">󰖩</div><div class="slot dim">󰕾</div><div class="slot dim">󰁹</div>
+    </div>
+  </div>
+  <div class="panelwrap">
+    <div class="panel">
+      <div class="hero" style="margin-bottom:14px">
+        <div class="txt"><div class="title">Transfers</div><div class="metaline">2 active · 11.4 MiB/s</div></div>
+        <div class="act"><div class="iconbtn" title="Clear finished">󰩹</div></div>
+      </div>
+
+      <div class="card on">
+        <div class="top"><span>󰇚</span><span class="lbl">receipts.zip</span><span class="st live">62%</span></div>
+        <div class="path">/Documents/Invoices → ~/Downloads</div>
+        <div class="prog"><span style="width:62%"></span></div>
+      </div>
+      <div class="card on">
+        <div class="top"><span>󰕒</span><span class="lbl">screenshots/ (48 files)</span><span class="st live">17%</span></div>
+        <div class="path">~/Pictures/screenshots → /Pictures</div>
+        <div class="prog"><span style="width:17%"></span></div>
+      </div>
+      <div class="card">
+        <div class="top"><span style="color:var(--green)">󰄬</span><span class="lbl">backup.tar.zst</span><span class="st">done · 2m ago</span></div>
+        <div class="path">1.8 GiB · uploaded to /Backups</div>
+      </div>
+      <div class="hints"><span><b>x</b> cancel</span><span><b>⏎</b> reveal</span><span><b>c</b> clear finished</span></div>
+    </div>
+  </div>
+</div>
+
+<div style="display:flex;gap:16px;margin:18px 0 0;flex-wrap:wrap">
+  <div class="osd">
+    <div class="t"><span style="color:var(--green)">󰄬</span> Upload finished</div>
+    <div class="b">screenshots/ — 48 files, 214 MiB → /Pictures</div>
+  </div>
+  <div class="osd">
+    <div class="t"><span style="color:var(--accent)">󰌷</span> Public link copied</div>
+    <div class="b">invoice-0184.pdf · expires in 7 days</div>
+  </div>
+  <div class="osd">
+    <div class="t"><span style="color:var(--urgent)">󰀦</span> Drive 91% full</div>
+    <div class="b">932 GiB of 1 TiB used</div>
+  </div>
+</div>
+<p class="caption">Notifications go through the shell's own notification service — no custom toast layer.</p>
+
+<!-- ============================================================ -->
+<h2><span class="n">04 ·</span> What is actually buildable</h2>
+<p class="lead">This is the part worth reading before writing code. I read the current Filen CLI source rather than the marketing page, and the situation changed recently.</p>
+
+<div class="note warn">
+  <b>The TypeScript CLI is sunset.</b> <code>FilenCloudDienste/filen-cli</code> now tells you to stop using it; development moved to a Rust rewrite in <code>filen-rs/filen-cli</code>, currently <b>public beta at v0.2.7</b>. The Rust CLI dropped native <code>sync</code>, <code>mount</code>, <code>webdav</code> and <code>s3</code> implementations — those now shell out to a <b>managed rclone</b>. Any plugin built today should target the Rust CLI and treat rclone as the transport for mounts/servers.
+</div>
+
+<table>
+<tr><th>Panel feature</th><th>Backed by</th><th>Status</th></tr>
+<tr><td>Browse / breadcrumb</td><td><code>filen --json ls &lt;dir&gt;</code></td><td class="yes">Real — returns <code>{directories[], files[]}</code></td></tr>
+<tr><td>File details, size, dates</td><td><code>filen --json stat &lt;path&gt;</code></td><td class="yes">Real — name/type/size/modified/created/uuid</td></tr>
+<tr><td>Drive quota meter</td><td><code>filen --json stat /</code></td><td class="yes">Real — <code>usedStorage</code> / <code>totalStorage</code></td></tr>
+<tr><td>Upload / download</td><td><code>filen upload</code>, <code>filen download</code></td><td class="yes">Real — but progress is a TTY bar, not JSON</td></tr>
+<tr><td>Trash + restore</td><td><code>filen list-trash</code>, <code>empty-trash</code></td><td class="maybe">Exists, but <b>interactive</b> — needs care</td></tr>
+<tr><td>Favorites</td><td><code>filen favorite</code> / <code>unfavorite</code></td><td class="yes">Real</td></tr>
+<tr><td>Search</td><td><code>filen search</code></td><td class="no">Interactive-only — no scriptable form yet</td></tr>
+<tr><td>Mount network drive</td><td><code>filen mount</code> → rclone</td><td class="maybe">Real, long-running child process</td></tr>
+<tr><td>WebDAV / FTP / SFTP / HTTP</td><td><code>filen serve &lt;type&gt;</code></td><td class="maybe">Real, long-running</td></tr>
+<tr><td>Sync pairs</td><td>—</td><td class="no"><b>Gone</b> in the Rust CLI. rclone only.</td></tr>
+<tr><td>Public links</td><td>—</td><td class="no">Not in the Rust CLI yet (was in the TS one)</td></tr>
+<tr><td>Notes / chats / contacts</td><td>—</td><td class="no">SDK/API only — no CLI surface</td></tr>
+</table>
+
+<p class="lead">Which gives an honest scope ladder:</p>
+<ul>
+  <li><b>v0.1</b> <span class="tag v1">ship first</span> — drive glyph + quota badge, browse with breadcrumb, stat details, download to <code>~/Downloads</code>, upload via file picker, favorites, open web drive. Every one of these is a clean <code>--json</code> or exit-code call.</li>
+  <li><b>v0.2</b> <span class="tag v2">next</span> — transfers list with cancel, mounts &amp; servers panel with toggles, trash view, notifications on completion.</li>
+  <li><b>later</b> <span class="tag later">blocked upstream</span> — search (needs a non-interactive flag), public links (needs CLI support), notes/chat (needs direct SDK use). Track these as upstream feature requests, not local hacks.</li>
+</ul>
+
+<div class="note">
+  <b>Design consequence:</b> don't build a panel that promises sync pairs and public links today. Ship the browser — that's the thing you'd genuinely use daily, it's fully supported, and it's the part the website is slowest at.
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">05 ·</span> Security shape</h2>
+<p class="lead">The plugin runs unsandboxed inside <code>omarchy-shell</code>, and Filen is a zero-knowledge provider. Those two facts set hard rules.</p>
+
+<div class="grid2">
+<div>
+<ul>
+  <li><b>Never touch the password.</b> No password field in QML. Login happens in a terminal running the CLI's own prompt; the CLI stores the session in the system <b>keyring</b>.</li>
+  <li><b>Never read the auth config.</b> <code>filen-cli-auth-config.txt</code> holds master keys, the private key and the API key in plaintext at mode 600. The plugin must not read, copy, or display it — it only checks that auth <i>works</i>, via <code>filen whoami</code>.</li>
+  <li><b>Never pass secrets in argv.</b> Anything sensitive goes over stdin, the way the passpage plugin feeds curl a config file. Argv is world-readable in <code>/proc</code>.</li>
+  <li><b>No <code>FILEN_CLI_PASSWORD</code>.</b> Environment variables leak to every child process. The keyring path is the only one.</li>
+</ul>
+</div>
+<div>
+<ul>
+  <li><b>Treat CLI output as hostile.</b> Filenames are attacker-influenced (a shared folder can be named anything). Cap response size, parse JSON strictly, and pass paths as positional args — never interpolate into a shell string.</li>
+  <li><b>Servers bind to loopback by default</b>, read-only, with generated credentials. A public bind is an explicit choice behind a warning.</li>
+  <li><b>No auto-install.</b> The CLI's own auto-updater downloads and replaces binaries; the plugin must never trigger it silently. Copy the install command, let the user run it.</li>
+  <li><b>Confirm every destructive action.</b> Delete and empty-trash go through <code>ConfirmDialog</code> defaulting to Cancel, exactly like passpage's delete flow.</li>
+</ul>
+</div>
+</div>
+
+<div class="flow">
+  <span class="n">Panel.qml</span><span class="ar">→</span>
+  <span class="n">Service.qml</span><span class="ar">→</span>
+  <span class="n">Process: filen --json</span><span class="ar">→</span>
+  <span class="n">keyring</span><span class="ar">→</span>
+  <span class="n">Filen API</span>
+  <span style="margin-left:8px">· secrets never cross the first two boxes</span>
+</div>
+
+<!-- ============================================================ -->
+<h2><span class="n">06 ·</span> File layout</h2>
+<p class="lead">Matching the shape the shell expects and the conventions your two installed plugins already follow.</p>
+
+<div class="screen" style="padding:18px 20px;background:#000">
+<pre style="margin:0;color:var(--dim);font-size:12px;line-height:1.75">filen-omarchy-plugin/
+<span style="color:var(--fg)">manifest.json</span>        <span style="color:var(--muted)">id io.github.zeus-deus.filen · kind bar-widget · entry Panel.qml</span>
+<span style="color:var(--fg)">Panel.qml</span>            <span style="color:var(--muted)">bar button + KeyboardPanel; cursor model, rows, views</span>
+<span style="color:var(--fg)">Service.qml</span>          <span style="color:var(--muted)">filen Processes, drive state, transfer tracking, polling</span>
+<span style="color:var(--fg)">FilenIcon.qml</span>        <span style="color:var(--muted)">the glyph drawn natively (no bundled image)</span>
+<span style="color:var(--fg)">Model.js</span>             <span style="color:var(--muted)">pure helpers — path join, size format, JSON guards</span>
+<span style="color:var(--fg)">tests/model.test.js</span>  <span style="color:var(--muted)">node --test, no Qt imports</span>
+<span style="color:var(--fg)">AGENTS.md</span>            <span style="color:var(--muted)">conventions + traps for future you</span>
+<span style="color:var(--fg)">README.md</span>  <span style="color:var(--fg)">LICENSE</span>
+</pre>
+</div>
+
+<div class="note">
+  <b>Traps already known</b> (learned the hard way in your passpage plugin): <code>KeyboardPanel</code> doesn't scroll — wrap it in a <code>Flickable</code>. <code>escape()</code> is a reserved method name. <code>h</code> can't be a shortcut. <code>qmllint</code> can't parse <code>qs.Ui</code> imports, so the real gates are <code>omarchy plugin validate .</code> and <code>qs log -p /usr/share/omarchy/shell --tail 60</code>. Editing <code>Panel.qml</code> needs <code>omarchy-restart-shell</code>.
+</div>
+
+<p class="meta" style="margin-top:56px">Sources read directly: <code>/usr/share/omarchy/shell/README.md</code> · <code>shell/plugins/README.md</code> · installed <code>space.passpage.shares</code> and <code>io.github.zeus-deus.gazelle</code> · <code>filen-rs/filen-cli/src/{main,commands,auth}.rs</code> @ main · docs.filen.io · docs.cli.filen.io</p>
+
+</div>
+</body>
+</html>

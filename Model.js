@@ -1,0 +1,430 @@
+// Pure helpers for the Filen plugin. No Qt imports — this file is loaded by
+// QML via `import "Model.js" as Model` AND by `node --test tests/model.test.js`.
+//
+// Threat model: every string that arrives from the `filen` CLI is treated as
+// attacker-influenced. A shared folder, a public link someone sent you, or a
+// synced device can put arbitrary bytes in a filename: newlines, ANSI escapes,
+// leading dashes, "..", NUL, RTL overrides. Nothing here may assume otherwise.
+
+// Ceilings. The CLI is a child process; a hostile or wedged one must never be
+// able to grow the shell's heap without bound.
+var MAX_RESPONSE_BYTES = 4 * 1024 * 1024;  // one `ls` of a huge directory
+var MAX_STDERR_BYTES = 8 * 1024;
+var MAX_ENTRIES = 5000;                     // rows kept from a single listing
+var MAX_NAME_DISPLAY = 120;                 // chars shown in a row
+var MAX_PATH_DEPTH = 64;
+
+// ---------------------------------------------------------------- text safety
+
+// Strip everything that could corrupt the panel or the surrounding terminal
+// when a name is rendered or logged. Control chars (including NUL, ESC, CR,
+// LF), Unicode bidi overrides, and zero-width joiners are removed rather than
+// escaped: the panel shows names, it does not need to round-trip them.
+// The real path used for CLI calls is kept separately and never passes here.
+function sanitizeText(value, limit) {
+  var s = String(value === undefined || value === null ? "" : value);
+  // C0 + DEL + C1 -> space, not deletion: "a\nb" must read "a b", never "ab"
+  // (deleting would let a newline disguise two words as one identifier).
+  s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
+  // bidi overrides / embedding (RTL filename spoofing) — removed outright
+  s = s.replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "");
+  // zero-width
+  s = s.replace(/[\u200B-\u200D\uFEFF]/g, "");
+  s = s.replace(/\s+/g, " ").replace(/^ +| +$/g, "");
+  var max = limit === undefined ? MAX_NAME_DISPLAY : limit;
+  if (s.length > max) s = s.slice(0, Math.max(0, max - 1)) + "\u2026";
+  return s;
+}
+
+// A name is *usable* (safe to send back to the CLI as part of a path) only if
+// it survives sanitizing unchanged in the ways that matter. We reject rather
+// than repair: acting on a path we had to rewrite is how you delete the wrong
+// file.
+function isUsableName(name) {
+  var s = String(name === undefined || name === null ? "" : name);
+  if (s === "" || s === "." || s === "..") return false;
+  if (s.length > 255) return false;
+  if (/[\u0000-\u001F\u007F]/.test(s)) return false;   // control chars
+  if (s.indexOf("/") !== -1) return false;             // path separator
+  return true;
+}
+
+// ---------------------------------------------------------------- paths
+
+// Filen paths are POSIX-like and always absolute from the drive root.
+// Built by joining validated segments — never by string-concatenating user
+// input into a shell command (we never use a shell at all; see Service.qml).
+function joinPath(base, name) {
+  var b = normalizePath(base);
+  if (!isUsableName(name)) return null;
+  return b === "/" ? "/" + name : b + "/" + name;
+}
+
+function normalizePath(path) {
+  var s = String(path === undefined || path === null ? "/" : path);
+  if (s === "") return "/";
+  var parts = s.split("/");
+  var out = [];
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i];
+    if (p === "" || p === ".") continue;
+    if (p === "..") { out.pop(); continue; }
+    out.push(p);
+    if (out.length > MAX_PATH_DEPTH) break;
+  }
+  return "/" + out.join("/");
+}
+
+function parentPath(path) {
+  var n = normalizePath(path);
+  if (n === "/") return "/";
+  var idx = n.lastIndexOf("/");
+  return idx <= 0 ? "/" : n.slice(0, idx);
+}
+
+function basename(path) {
+  var n = normalizePath(path);
+  if (n === "/") return "/";
+  return n.slice(n.lastIndexOf("/") + 1);
+}
+
+// Breadcrumb segments for display: [{label, path}], root first.
+function crumbs(path) {
+  var n = normalizePath(path);
+  var out = [{ label: "/", path: "/" }];
+  if (n === "/") return out;
+  var parts = n.split("/").slice(1);
+  var acc = "";
+  for (var i = 0; i < parts.length; i++) {
+    acc += "/" + parts[i];
+    out.push({ label: sanitizeText(parts[i], 40), path: acc });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- JSON
+
+// Bounded, total JSON parse. Returns null on anything unexpected rather than
+// throwing into a QML signal handler (which would tear down the binding).
+function parseJson(text) {
+  var s = String(text === undefined || text === null ? "" : text);
+  if (s.length === 0 || s.length > MAX_RESPONSE_BYTES) return null;
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    return null;
+  }
+}
+
+// `filen --json ls <dir>` => {"directories": string[], "files": string[]}
+// Names only — no sizes, no dates. Sizes require a per-entry `stat`, which the
+// service does lazily for the focused row only.
+function parseListing(text) {
+  var data = parseJson(text);
+  if (!data || typeof data !== "object") return null;
+  var dirs = data.directories instanceof Array ? data.directories : [];
+  var files = data.files instanceof Array ? data.files : [];
+  var out = [];
+  var i;
+  for (i = 0; i < dirs.length && out.length < MAX_ENTRIES; i++) {
+    var dn = dirs[i];
+    if (typeof dn !== "string" || !isUsableName(dn)) continue;
+    out.push({ name: dn, display: sanitizeText(dn), dir: true, kind: "directory" });
+  }
+  for (i = 0; i < files.length && out.length < MAX_ENTRIES; i++) {
+    var fn = files[i];
+    if (typeof fn !== "string" || !isUsableName(fn)) continue;
+    out.push({ name: fn, display: sanitizeText(fn), dir: false, kind: kindOf(fn) });
+  }
+  return out;
+}
+
+// `filen --json stat <path>` for a file / dir / the drive root.
+function parseStat(text) {
+  var d = parseJson(text);
+  if (!d || typeof d !== "object") return null;
+  if (d.type === "drive") {
+    var used = toNumber(d.usedStorage);
+    var total = toNumber(d.totalStorage);
+    if (used === null || total === null || total <= 0) return null;
+    return { type: "drive", used: used, total: total };
+  }
+  if (d.type === "file") {
+    return {
+      type: "file",
+      name: sanitizeText(d.name),
+      size: toNumber(d.size),
+      modified: toNumber(d.modified),
+      created: toNumber(d.created),
+      uuid: typeof d.uuid === "string" ? sanitizeText(d.uuid, 64) : ""
+    };
+  }
+  if (d.type === "directory") {
+    return {
+      type: "directory",
+      name: sanitizeText(d.name),
+      created: toNumber(d.created),
+      uuid: typeof d.uuid === "string" ? sanitizeText(d.uuid, 64) : ""
+    };
+  }
+  return null;
+}
+
+function toNumber(v) {
+  if (v === undefined || v === null || v === "") return null;
+  var n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+// ---------------------------------------------------------------- file kinds
+
+var IMAGE_EXT = ["png","jpg","jpeg","gif","webp","bmp","avif","jxl","tiff","tif","ico","svg"];
+var VIDEO_EXT = ["mp4","mkv","webm","mov","avi","m4v","wmv","flv","mpg","mpeg"];
+var AUDIO_EXT = ["mp3","flac","wav","ogg","opus","m4a","aac","wma"];
+var DOC_EXT   = ["pdf","epub","djvu"];
+var TEXT_EXT  = ["txt","md","markdown","json","yaml","yml","toml","ini","conf",
+                 "log","csv","tsv","xml","html","css","js","ts","py","rs","go",
+                 "sh","bash","c","h","cpp","hpp","java","rb","lua","sql"];
+var ARCHIVE_EXT = ["zip","tar","gz","tgz","bz2","xz","zst","7z","rar"];
+
+function extensionOf(name) {
+  var s = String(name || "");
+  var dot = s.lastIndexOf(".");
+  if (dot <= 0 || dot === s.length - 1) return "";
+  return s.slice(dot + 1).toLowerCase();
+}
+
+function kindOf(name) {
+  var e = extensionOf(name);
+  if (e === "") return "file";
+  if (IMAGE_EXT.indexOf(e) !== -1) return "image";
+  if (VIDEO_EXT.indexOf(e) !== -1) return "video";
+  if (AUDIO_EXT.indexOf(e) !== -1) return "audio";
+  if (DOC_EXT.indexOf(e) !== -1) return "document";
+  if (TEXT_EXT.indexOf(e) !== -1) return "text";
+  if (ARCHIVE_EXT.indexOf(e) !== -1) return "archive";
+  return "file";
+}
+
+// Nerd Font glyphs, matching the vocabulary the first-party panels use.
+function iconFor(entry) {
+  if (!entry) return "\udb80\udc94";
+  if (entry.dir) return "\udb83\udc4b";           // 󰉋 folder
+  switch (entry.kind) {
+    case "image":    return "\udb80\udeE9";        // 󰋩
+    case "video":    return "\udb81\udd6d";        // 󰵭
+    case "audio":    return "\udb81\udd1e";        // 󰴞
+    case "document": return "\udb85\udc11";        // 󰈙-ish
+    case "text":     return "\udb80\udc15";        // 󰀕
+    case "archive":  return "\udb82\udd3a";        // 󰤺
+    default:         return "\udb80\udc94";        // 󰂔 generic file
+  }
+}
+
+// Only these open in a viewer. Everything else must be downloaded first and
+// handed to xdg-open explicitly by the user.
+function isPreviewable(entry) {
+  if (!entry || entry.dir) return false;
+  var k = entry.kind;
+  return k === "image" || k === "video" || k === "audio" || k === "document" || k === "text";
+}
+
+// ---------------------------------------------------------------- formatting
+
+function formatSize(bytes) {
+  var n = Number(bytes);
+  if (!isFinite(n) || n < 0) return "";
+  if (n < 1024) return n + " B";
+  var units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+  var v = n / 1024;
+  var i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)) + " " + units[i];
+}
+
+function formatPercent(used, total) {
+  var u = Number(used), t = Number(total);
+  if (!isFinite(u) || !isFinite(t) || t <= 0) return 0;
+  return Math.max(0, Math.min(1, u / t));
+}
+
+// The CLI emits epoch milliseconds for modified/created.
+function formatDate(ms) {
+  var n = Number(ms);
+  if (!isFinite(n) || n <= 0) return "";
+  var d = new Date(n);
+  if (isNaN(d.getTime())) return "";
+  var pad = function (x) { return x < 10 ? "0" + x : String(x); };
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+    + " " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+
+function relativeTime(ms, nowMs) {
+  var n = Number(ms);
+  var now = Number(nowMs) || Date.now();
+  if (!isFinite(n) || n <= 0) return "";
+  var diff = Math.floor((now - n) / 1000);
+  if (diff < 0) return "just now";
+  if (diff < 60) return diff + "s ago";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
+}
+
+// ---------------------------------------------------------------- errors
+
+// Map a CLI failure to something a human can act on. `stderr` is CLI-controlled
+// text, so it is sanitized and truncated before it ever reaches a Text element.
+function errorMessage(exitCode, stderr) {
+  var text = sanitizeText(stderr, 200);
+  if (isAuthError(stderr)) return "Not signed in to Filen";
+  if (text === "") return "Filen CLI failed (exit " + exitCode + ")";
+  return text;
+}
+
+// The CLI has no `whoami`. When it needs credentials and has no TTY it fails
+// with this specific message on stderr and a non-zero exit. That is our
+// "signed out" signal — checked as a substring because the CLI decorates it
+// with a ✘ and colour codes.
+function isAuthError(stderr) {
+  var s = String(stderr || "");
+  return s.indexOf("Failed to read input from terminal") !== -1
+      || s.indexOf("Invalid credentials") !== -1
+      || s.indexOf("Please ensure that the terminal supports interactive input") !== -1;
+}
+
+function isNotFoundError(stderr) {
+  var s = String(stderr || "");
+  return s.indexOf("No such file or directory") !== -1
+      || s.indexOf("Failed to find item") !== -1;
+}
+
+// Oversized/failed transfer detection, mirroring the passpage plugin: head
+// closing the pipe makes the producer fail its write.
+function oversized(exitCode, output) {
+  return exitCode === 23 || exitCode === 141
+    || String(output || "").length >= MAX_RESPONSE_BYTES;
+}
+
+// ---------------------------------------------------------------- listing ops
+
+function sortEntries(entries) {
+  var list = (entries || []).slice();
+  list.sort(function (a, b) {
+    if (a.dir !== b.dir) return a.dir ? -1 : 1;
+    return a.display.localeCompare(b.display, undefined, { numeric: true, sensitivity: "base" });
+  });
+  return list;
+}
+
+// Cheap identity check so the Repeater is not rebuilt (and an open dialog
+// destroyed) when a refresh returns the same rows.
+function sameEntries(a, b) {
+  var x = a || [], y = b || [];
+  if (x.length !== y.length) return false;
+  for (var i = 0; i < x.length; i++) {
+    if (x[i].name !== y[i].name) return false;
+    if (x[i].dir !== y[i].dir) return false;
+    if (x[i].size !== y[i].size) return false;
+  }
+  return true;
+}
+
+function filterEntries(entries, query) {
+  var q = String(query || "").toLowerCase().replace(/^\s+|\s+$/g, "");
+  if (q === "") return entries || [];
+  var out = [];
+  var list = entries || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].display.toLowerCase().indexOf(q) !== -1) out.push(list[i]);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- local paths
+
+// Guard for the configured download directory. Must be an absolute path with
+// no shell metacharacters and no traversal; anything else falls back to the
+// default so a bad setting can never redirect writes somewhere surprising.
+function validatedDownloadDir(value, home) {
+  var s = String(value || "").replace(/^\s+|\s+$/g, "");
+  var fallback = (home || "") + "/Downloads";
+  if (s === "") return fallback;
+  if (s.charAt(0) === "~") s = (home || "") + s.slice(1);
+  if (s.charAt(0) !== "/") return fallback;
+  if (s.indexOf("..") !== -1) return fallback;
+  if (/[\u0000-\u001F]/.test(s)) return fallback;
+  // No shell is ever used, but refuse obviously hostile values anyway.
+  if (/[`$;|&<>\n\r]/.test(s)) return fallback;
+  return s.replace(/\/+$/, "") || "/";
+}
+
+// Local filename for a downloaded remote entry. Rejects anything unusable so
+// we never write outside the chosen directory.
+function localTargetName(name) {
+  return isUsableName(name) ? name : null;
+}
+
+// ---------------------------------------------------------------- transfers
+
+function makeTransfer(id, kind, label, remotePath, localPath) {
+  return {
+    id: id,
+    kind: kind,                       // "download" | "upload"
+    label: sanitizeText(label, 60),
+    remotePath: remotePath,
+    localPath: localPath,
+    state: "running",                 // running | done | failed | canceled
+    error: "",
+    startedMs: Date.now()
+  };
+}
+
+function transferSummary(list) {
+  var running = 0, failed = 0;
+  var items = list || [];
+  for (var i = 0; i < items.length; i++) {
+    if (items[i].state === "running") running++;
+    else if (items[i].state === "failed") failed++;
+  }
+  return { running: running, failed: failed, total: items.length };
+}
+
+// ---------------------------------------------------------------- exports
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    MAX_RESPONSE_BYTES: MAX_RESPONSE_BYTES,
+    MAX_STDERR_BYTES: MAX_STDERR_BYTES,
+    MAX_ENTRIES: MAX_ENTRIES,
+    sanitizeText: sanitizeText,
+    isUsableName: isUsableName,
+    joinPath: joinPath,
+    normalizePath: normalizePath,
+    parentPath: parentPath,
+    basename: basename,
+    crumbs: crumbs,
+    parseJson: parseJson,
+    parseListing: parseListing,
+    parseStat: parseStat,
+    extensionOf: extensionOf,
+    kindOf: kindOf,
+    iconFor: iconFor,
+    isPreviewable: isPreviewable,
+    formatSize: formatSize,
+    formatPercent: formatPercent,
+    formatDate: formatDate,
+    relativeTime: relativeTime,
+    errorMessage: errorMessage,
+    isAuthError: isAuthError,
+    isNotFoundError: isNotFoundError,
+    oversized: oversized,
+    sortEntries: sortEntries,
+    sameEntries: sameEntries,
+    filterEntries: filterEntries,
+    validatedDownloadDir: validatedDownloadDir,
+    localTargetName: localTargetName,
+    makeTransfer: makeTransfer,
+    transferSummary: transferSummary
+  };
+}

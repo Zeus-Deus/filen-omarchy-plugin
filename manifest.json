@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.zeus-deus.filen",
+  "name": "Filen",
+  "version": "0.1.0",
+  "author": "Zeus-Deus",
+  "license": "MIT",
+  "description": "Browse, download, upload and open your end-to-end encrypted Filen drive from the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Filen",
+    "description": "Filen drive browser with quota, downloads, uploads and quick open.",
+    "category": "Cloud",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "downloadDir": "",
+      "confirmDelete": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Quota refresh interval (seconds)",
+        "description": "How often drive usage is refreshed in the background. The panel always refreshes when opened.",
+        "min": 60,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 300
+      },
+      {
+        "key": "downloadDir",
+        "type": "string",
+        "label": "Download directory",
+        "description": "Where downloads are saved. Leave empty to use ~/Downloads.",
+        "defaultValue": ""
+      },
+      {
+        "key": "confirmDelete",
+        "type": "boolean",
+        "label": "Confirm before deleting",
+        "description": "Ask before moving an item to the Filen trash. Strongly recommended.",
+        "defaultValue": true
+      }
+    ]
+  }
+}
