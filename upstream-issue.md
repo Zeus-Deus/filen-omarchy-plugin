@@ -88,11 +88,7 @@ auth_version = <REDACTED>
 base_folder_uuid = <REDACTED>
 ```
 
-Any other user on the host can then read it directly:
-
-```console
-$ sudo -u nobody cat /home/user/.config/filen-cli/rclone/rclone.conf
-```
+Whether another local user can then *reach* it depends on the home directory, which this project does not control (see the correction comment on the issue): on distributions with 0700 homes (Arch, Fedora, Ubuntu >= 21.04) and on macOS, traversal is blocked; on Debian-style 0755 homes, shared/NFS homes, CI runners and multi-user servers, it is directly readable.
 
 ### Standalone proof of the mode difference
 
