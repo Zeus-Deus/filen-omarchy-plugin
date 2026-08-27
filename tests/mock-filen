@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Fake `filen` CLI for testing the plugin without a live account.
+#
+# Reproduces the real v0.2.7 behaviours the plugin depends on, including the
+# ones that are easy to get wrong:
+#   * failure messages go to STDOUT (not stderr), exit code non-zero
+#   * signed-out looks like: "✘ Failed to read input from terminal..."
+#   * --json shapes for ls / stat(file) / stat(dir) / stat(/)
+#
+# Modes via FILEN_MOCK_MODE:
+#   ok         (default) a small tree with normal + hostile filenames
+#   signedout  every command fails the way a signed-out CLI does
+#   empty      authenticated but every folder is empty
+#   slow       like ok, but sleeps so transfer/cancel UI can be exercised
+#   garbage    returns malformed JSON, to prove the parser fails closed
+#   huge       returns a very large listing, to exercise the entry cap
+
+MODE="${FILEN_MOCK_MODE:-ok}"
+
+# strip global flags the plugin passes
+ARGS=()
+JSON=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-update|--quiet|-q) shift ;;
+    --json) JSON=1; shift ;;
+    --version|-V) echo "Filen CLI 0.2.7-mock"; exit 0 ;;
+    --) shift; ARGS+=("$@"); break ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+signedout() {
+  # NOTE: stdout, not stderr — this is what the real CLI does.
+  echo "✘ Failed to read input from terminal. Please ensure that the terminal supports interactive input."
+  exit 1
+}
+
+[[ "$MODE" == "signedout" ]] && signedout
+
+CMD="${ARGS[0]:-}"
+P1="${ARGS[1]:-}"
+P2="${ARGS[2]:-}"
+
+case "$CMD" in
+  stat)
+    if [[ "$MODE" == "garbage" ]]; then echo '{"type":"drive","usedStorage":'; exit 0; fi
+    case "$P1" in
+      /)
+        [[ $JSON == 1 ]] \
+          && echo '{"type":"drive","usedStorage":442937589760,"totalStorage":1099511627776}' \
+          || echo "Used: 412 GiB"
+        ;;
+      */*.*)
+        [[ $JSON == 1 ]] \
+          && echo "{\"name\":\"$(basename "$P1")\",\"type\":\"file\",\"size\":248320,\"modified\":1755000000000,\"created\":1750000000000,\"uuid\":\"mock-uuid-file\"}" \
+          || echo "File"
+        ;;
+      *)
+        [[ $JSON == 1 ]] \
+          && echo "{\"name\":\"$(basename "$P1")\",\"type\":\"directory\",\"created\":1750000000000,\"uuid\":\"mock-uuid-dir\"}" \
+          || echo "Directory"
+        ;;
+    esac
+    ;;
+
+  ls)
+    if [[ "$MODE" == "empty" ]]; then echo '{"directories":[],"files":[]}'; exit 0; fi
+    if [[ "$MODE" == "garbage" ]]; then echo 'not json at all'; exit 0; fi
+    if [[ "$MODE" == "huge" ]]; then
+      python3 - <<'PY'
+import json
+print(json.dumps({"directories":[f"dir{i}" for i in range(200)],
+                  "files":[f"file{i}.txt" for i in range(8000)]}))
+PY
+      exit 0
+    fi
+    case "$P1" in
+      /Documents)
+        echo '{"directories":["Invoices","Contracts"],"files":["notes.md","budget.xlsx"]}'
+        ;;
+      /Documents/Invoices)
+        echo '{"directories":[],"files":["invoice-0184.pdf","invoice-0185.pdf","summary.csv"]}'
+        ;;
+      /Pictures)
+        # deliberately hostile names — the plugin must render these safely
+        printf '%s\n' '{"directories":["Screenshots"],"files":["sunset.jpg","clip.mp4","song.flac","ev'"$(printf '\\u202E')"'il-gnp.exe","weird\ttab.png","-leading-dash.png"]}'
+        ;;
+      *)
+        echo '{"directories":["Documents","Pictures","Backups"],"files":["README.txt","archive.tar.gz","photo.png","movie.mkv","track.mp3","report.pdf"]}'
+        ;;
+    esac
+    ;;
+
+  download)
+    [[ "$MODE" == "slow" ]] && sleep 12
+    dest="${P2:-.}"
+    mkdir -p "$dest" 2>/dev/null
+    name="$(basename "$P1")"
+    case "$name" in
+      *.png|*.jpg|*.jpeg)
+        # a real 1x1 PNG so viewers actually open
+        printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\x0d\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > "$dest/$name"
+        ;;
+      *) echo "mock content for $name" > "$dest/$name" ;;
+    esac
+    echo "Downloaded $name"
+    ;;
+
+  upload)
+    [[ "$MODE" == "slow" ]] && sleep 12
+    echo "Uploaded $(basename "$P1")"
+    ;;
+
+  rm)     echo "Moved to trash" ;;
+  mkdir)  echo "Created directory" ;;
+
+  *)
+    echo "error: unrecognized subcommand '$CMD'"
+    exit 2
+    ;;
+esac

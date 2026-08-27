@@ -4,8 +4,18 @@ import Quickshell.Io
 import qs.Commons
 import "Model.js" as Model
 
-// Drives the official Filen CLI (`filen`, the Rust rewrite) as a child
-// process and exposes its state as plain QML properties.
+// Drives the official Filen CLI (the Rust rewrite, v0.2.x) as a child process
+// and exposes its state as plain QML properties.
+//
+// ── Which CLI surface we use, and why ─────────────────────────────────────
+// v0.2.7 ships two families of commands:
+//   * native:  ls, stat, mkdir, rm, mv, cp, favorite, cat, head, tail
+//   * managed rclone:  `filen rclone <args>` against the "filen:" remote
+// The native `ls --json` returns NAMES ONLY (no sizes/dates), and v0.2.7 has
+// NO upload/download subcommand at all (those exist only on git main). The
+// managed rclone path gives us `lsjson` — one call returning name, size,
+// mtime, MIME type and directory flag — plus copy for transfers. So listings
+// and transfers go through rclone; small metadata ops use the native verbs.
 //
 // ── Security model ────────────────────────────────────────────────────────
 // * The plugin NEVER handles the account password. Sign-in happens in a real
@@ -14,20 +24,25 @@ import "Model.js" as Model
 //   observe whether a command succeeded.
 // * No secret is ever passed in argv. /proc/<pid>/cmdline is world-readable,
 //   so argv is a public channel. We pass nothing sensitive at all.
-// * FILEN_CLI_PASSWORD / FILEN_CLI_EMAIL are never set. Environment is
-//   inherited as-is; we do not inject credentials into any child.
+// * FILEN_CLI_PASSWORD / FILEN_CLI_EMAIL are never set.
 // * Every command runs WITHOUT a shell: `command` is an argv array, so
 //   filenames containing ;, $(), backticks, newlines etc. are inert data.
-//   `--` terminates option parsing so a name starting with '-' can never be
-//   read as a flag.
-// * The CLI's auth config file (master keys + private key + API key in
-//   plaintext) is never read, copied, or displayed by this plugin.
-// * `export-api-key` / `export-auth-config` are never invoked.
+// * The CLI's auth config (master keys + private key + API key in plaintext)
+//   is never read, copied, or displayed. `export-api-key` and
+//   `export-auth-config` are never invoked.
 // * --skip-update on every call: the CLI's auto-updater replaces its own
-//   binary, and that must be a deliberate user action, never a side effect
-//   of opening a panel.
+//   binary, which must be a deliberate user action, never a side effect of
+//   opening a panel.
 // * All CLI output is treated as attacker-influenced (shared folders can be
 //   named anything) and is size-capped + sanitized in Model.js before display.
+//
+// ── CLI quirks (verified against v0.2.7 on this machine) ─────────────────
+// * Failure messages go to STDOUT, not stderr; stderr is usually empty.
+//   Classify on both streams or a signed-out account reads as signed in.
+// * `--` is accepted by ls/stat/mkdir/rm but NOT by the rclone passthrough.
+// * The CLI writes ~/.config/filen-cli/rclone/rclone.conf containing the
+//   master keys, private key and API key — and creates it mode 0644
+//   (world-readable). We detect that and warn; we never read the contents.
 Item {
   id: root
 
@@ -41,6 +56,10 @@ Item {
   property bool signedIn: false
   property bool authChecked: false
 
+  // Security posture of the CLI's own credential cache.
+  property bool configWorldReadable: false
+  property string configPath: ""
+
   // ── drive ──────────────────────────────────────────────────────────────
   property double usedBytes: 0
   property double totalBytes: 0
@@ -53,10 +72,6 @@ Item {
   property bool listLoaded: false
   property string listError: ""
 
-  // ── focused-entry detail (lazy stat) ───────────────────────────────────
-  property string detailPath: ""
-  property var detailData: null
-
   // ── transfers ──────────────────────────────────────────────────────────
   property var transfers: []
   property int transferSeq: 0
@@ -65,8 +80,8 @@ Item {
   property string actionStatus: ""
   property string actionError: ""
 
-  // Invalidates in-flight responses whose context has changed (path change,
-  // sign-out, etc.) so a late reply can never repaint a newer view.
+  // Invalidates in-flight responses whose context changed (navigation,
+  // sign-out) so a late reply can never repaint a newer view.
   property int generation: 0
 
   readonly property bool busy: listing || quotaProcess.running
@@ -86,6 +101,7 @@ Item {
   signal entriesUpdated()
   signal transfersUpdated()
   signal navigated(string path)
+  signal transferFinished(string kind, string label, bool ok)
 
   function setting(name, fallback) {
     var v = settings ? settings[name] : undefined
@@ -100,11 +116,28 @@ Item {
 
   // ── argv construction ──────────────────────────────────────────────────
   //
-  // Every invocation goes through here. No shell, ever. `--` separates flags
-  // from operands so a path beginning with '-' is treated as a path.
+  // No shell, ever. `--quiet` is deliberately NOT passed: it suppresses the
+  // failure text we classify sign-in state on.
   function cliArgs(args) {
-    var base = [root.cliPath, "--skip-update", "--quiet"]
-    return base.concat(args)
+    return [root.cliPath, "--skip-update"].concat(args)
+  }
+
+  // Native verbs accept `--` to end option parsing, so a path starting with
+  // '-' can never be read as a flag.
+  function nativeArgs(args) {
+    return cliArgs(args)
+  }
+
+  // The rclone passthrough does NOT accept `--`; rclone parses its own argv.
+  // Remote paths are prefixed "filen:" and every path is a separate argv
+  // element, so no quoting or interpolation is involved.
+  function rcloneArgs(args) {
+    return cliArgs(["rclone"].concat(args))
+  }
+
+  function remoteUrl(path) {
+    var p = Model.normalizePath(path)
+    return "filen:" + (p === "/" ? "" : p)
   }
 
   function showStatus(text) {
@@ -117,6 +150,11 @@ Item {
     actionStatus = ""
     actionError = text
     statusTimer.restart()
+  }
+
+  // The CLI reports failures on stdout; stderr is typically empty.
+  function combinedOutput(a, b) {
+    return String(a || "") + "\n" + String(b || "")
   }
 
   // ── lifecycle ──────────────────────────────────────────────────────────
@@ -132,13 +170,32 @@ Item {
     if (!cliInstalled) { start(); return }
     refreshQuota()
     list(currentPath, true)
+    checkConfigPermissions()
   }
 
   function refreshQuota() {
     if (!cliInstalled || quotaProcess.running) return
     quotaProcess.generation = generation
-    quotaProcess.command = cliArgs(["--json", "stat", "--", "/"])
+    quotaProcess.command = rcloneArgs(["about", "filen:", "--json"])
     quotaProcess.running = true
+  }
+
+  // Warn if the CLI's credential cache is readable by other local users.
+  // We only stat() it — the contents are never read.
+  function checkConfigPermissions() {
+    if (permProcess.running) return
+    permProcess.command = ["bash", "-c",
+      "f=\"${XDG_CONFIG_HOME:-$HOME/.config}/filen-cli/rclone/rclone.conf\"; " +
+      "if [ -f \"$f\" ]; then printf '%s %s' \"$(stat -c %a -- \"$f\")\" \"$f\"; fi"]
+    permProcess.running = true
+  }
+
+  function hardenConfigPermissions() {
+    if (permFixProcess.running) return
+    permFixProcess.command = ["bash", "-c",
+      "f=\"${XDG_CONFIG_HOME:-$HOME/.config}/filen-cli/rclone/rclone.conf\"; " +
+      "[ -f \"$f\" ] && chmod 600 -- \"$f\""]
+    permFixProcess.running = true
   }
 
   // ── navigation ─────────────────────────────────────────────────────────
@@ -152,7 +209,8 @@ Item {
     listError = ""
     listProcess.generation = generation
     listProcess.targetPath = target
-    listProcess.command = cliArgs(["--json", "ls", "--", target])
+    // lsjson gives name + size + mtime + IsDir + MimeType in ONE call.
+    listProcess.command = rcloneArgs(["lsjson", remoteUrl(target)])
     listProcess.running = true
   }
 
@@ -161,8 +219,6 @@ Item {
     var next = Model.joinPath(currentPath, entry.name)
     if (next === null) { showError("Unsupported folder name"); return }
     generation++
-    detailPath = ""
-    detailData = null
     list(next, true)
     navigated(next)
   }
@@ -171,8 +227,6 @@ Item {
     if (atRoot) return
     var parent = Model.parentPath(currentPath)
     generation++
-    detailPath = ""
-    detailData = null
     list(parent, true)
     navigated(parent)
   }
@@ -181,26 +235,8 @@ Item {
     var target = Model.normalizePath(path)
     if (target === currentPath) return
     generation++
-    detailPath = ""
-    detailData = null
     list(target, true)
     navigated(target)
-  }
-
-  // ── lazy detail for the focused row ────────────────────────────────────
-
-  function loadDetail(entry) {
-    if (!entry || entry.dir || !cliInstalled) { detailData = null; detailPath = ""; return }
-    var p = Model.joinPath(currentPath, entry.name)
-    if (p === null) return
-    if (p === detailPath) return
-    detailPath = p
-    detailData = null
-    if (detailProcess.running) return
-    detailProcess.generation = generation
-    detailProcess.wantPath = p
-    detailProcess.command = cliArgs(["--json", "stat", "--", p])
-    detailProcess.running = true
   }
 
   // ── transfers ──────────────────────────────────────────────────────────
@@ -209,43 +245,56 @@ Item {
     return entry ? Model.joinPath(currentPath, entry.name) : null
   }
 
-  // Download to the configured directory. The CLI writes into a destination
-  // DIRECTORY, so the local filename is chosen by the CLI from the remote
-  // name — we validate the name first and refuse anything unusable.
+  // Download to the configured directory via `rclone copy`. rclone takes a
+  // destination DIRECTORY and preserves the basename.
   function download(entry, thenOpen) {
-    if (!entry || entry.dir === undefined) return
+    if (!entry) return
     var remote = remotePathFor(entry)
     if (remote === null) { showError("Unsupported name"); return }
-    if (Model.localTargetName(entry.name) === null) { showError("Unsupported name"); return }
+
+    // The remote path keeps the exact bytes (we must fetch the right object),
+    // but the LOCAL filename is sanitized: writing an attacker-chosen name
+    // verbatim would carry a bidi/control-character attack onto our disk,
+    // where a file manager would render "ev<RLO>gnp.exe" as "evexe.gnp".
+    var localName = Model.safeLocalName(entry.name)
+    if (localName === null) { showError("Unsupported name"); return }
 
     var id = "t" + (++transferSeq)
-    var local = downloadDir + "/" + entry.name
+    var local = downloadDir + "/" + localName
     var t = Model.makeTransfer(id, "download", entry.display, remote, local)
     t.openWhenDone = thenOpen === true
     t.kindHint = entry.kind
+    t.isDir = entry.dir === true
     pushTransfer(t)
 
-    var proc = transferComponent.createObject(root, {
-      transferId: id,
-      argv: cliArgs(["download", "--", remote, downloadDir])
-    })
-    if (!proc) { finishTransfer(id, 1, "Could not start download") ; return }
-    proc.running = true
+    if (entry.dir) {
+      // `copy` places the source's CONTENTS into dest, so name the dest after
+      // the (sanitized) folder to reproduce the remote structure.
+      startTransfer(id, rcloneArgs(["copy", remoteUrl(remote), local]))
+    } else {
+      // `copyto` writes exactly one destination path, which is what lets us
+      // choose the sanitized local filename instead of inheriting the remote.
+      startTransfer(id, rcloneArgs(["copyto", remoteUrl(remote), local]))
+    }
   }
 
   function upload(localPath) {
     var p = String(localPath || "")
     if (p === "" || p.charAt(0) !== "/") { showError("Pick a file to upload"); return }
+    if (/[\u0000-\u001F]/.test(p)) { showError("Unsupported path"); return }
     var name = p.slice(p.lastIndexOf("/") + 1)
     var id = "t" + (++transferSeq)
     var t = Model.makeTransfer(id, "upload", name, currentPath, p)
     pushTransfer(t)
+    // copyto preserves the exact destination name for a single file.
+    var destRemote = Model.joinPath(currentPath, name)
+    if (destRemote === null) { finishTransfer(id, 1, "Unsupported name"); return }
+    startTransfer(id, rcloneArgs(["copyto", p, remoteUrl(destRemote)]))
+  }
 
-    var proc = transferComponent.createObject(root, {
-      transferId: id,
-      argv: cliArgs(["upload", "--", p, currentPath])
-    })
-    if (!proc) { finishTransfer(id, 1, "Could not start upload"); return }
+  function startTransfer(id, argv) {
+    var proc = transferComponent.createObject(root, { transferId: id, argv: argv })
+    if (!proc) { finishTransfer(id, 1, "Could not start transfer"); return }
     proc.running = true
   }
 
@@ -255,11 +304,6 @@ Item {
     if (next.length > 40) next = next.slice(0, 40)
     transfers = next
     transfersUpdated()
-  }
-
-  function transferById(id) {
-    for (var i = 0; i < transfers.length; i++) if (transfers[i].id === id) return transfers[i]
-    return null
   }
 
   function updateTransfer(id, changes) {
@@ -280,24 +324,28 @@ Item {
     return hit
   }
 
-  function finishTransfer(id, exitCode, stderr) {
+  function finishTransfer(id, exitCode, output) {
     var ok = exitCode === 0
+    var canceled = exitCode === 143 || exitCode === 130 || exitCode === -15
     var t = updateTransfer(id, {
-      state: ok ? "done" : (exitCode === 143 || exitCode === 130 ? "canceled" : "failed"),
-      error: ok ? "" : Model.errorMessage(exitCode, stderr)
+      state: ok ? "done" : (canceled ? "canceled" : "failed"),
+      error: ok ? "" : Model.errorMessage(exitCode, output)
     })
-    if (!ok && Model.isAuthError(stderr)) { signedIn = false; authChecked = true }
-    if (ok && t) {
+    if (!ok && Model.isAuthError(output)) { signedIn = false; authChecked = true }
+    if (!t) return
+    if (ok) {
       if (t.kind === "download") {
         showStatus("Downloaded " + t.label)
-        if (t.openWhenDone) openLocal(t.localPath)
+        if (t.openWhenDone && !t.isDir) openLocal(t.localPath)
       } else {
         showStatus("Uploaded " + t.label)
         list(currentPath, true)
         refreshQuota()
       }
-    } else if (t && t.state === "failed") {
+      transferFinished(t.kind, t.label, true)
+    } else if (!canceled) {
       showError(t.error)
+      transferFinished(t.kind, t.label, false)
     }
   }
 
@@ -320,8 +368,8 @@ Item {
 
   // Hand a LOCAL file to the user's configured handler. xdg-open respects the
   // Omarchy defaults (imv for images, mpv for video, evince for PDF), so the
-  // plugin never hardcodes a viewer. Path travels as argv[1] of a fixed
-  // command — no shell, no interpolation.
+  // plugin never hardcodes a viewer. The path is argv[1] of a fixed command —
+  // no shell, no interpolation.
   function openLocal(path) {
     var p = String(path || "")
     if (p === "" || p.charAt(0) !== "/") return
@@ -331,7 +379,8 @@ Item {
   function revealLocal(path) {
     var p = String(path || "")
     if (p === "" || p.charAt(0) !== "/") return
-    Quickshell.execDetached(["xdg-open", p.slice(0, p.lastIndexOf("/")) || "/"])
+    var dir = p.slice(0, p.lastIndexOf("/"))
+    Quickshell.execDetached(["xdg-open", dir === "" ? "/" : dir])
   }
 
   // Sign-in: hand the user a real terminal running the CLI's own prompt.
@@ -357,17 +406,15 @@ Item {
     Quickshell.execDetached(["bash", "-c", "printf %s \"$1\" | wl-copy", "wl-copy", s])
   }
 
-  // ── delete ─────────────────────────────────────────────────────────────
+  // ── mutations ──────────────────────────────────────────────────────────
 
   function removeEntry(entry) {
     if (!entry || rmProcess.running) return
     var remote = remotePathFor(entry)
     if (remote === null) { showError("Unsupported name"); return }
-    rmProcess.generation = generation
     rmProcess.label = entry.display
-    // -y skips the CLI's own confirmation; the panel already confirmed.
-    // Items go to the Filen trash (no --no-trash) so this is recoverable.
-    rmProcess.command = cliArgs(["rm", "-y", "--", remote])
+    // No --permanent: items go to the Filen trash, so this is recoverable.
+    rmProcess.command = nativeArgs(["rm", "--", remote])
     rmProcess.running = true
   }
 
@@ -375,16 +422,15 @@ Item {
     if (!Model.isUsableName(name) || mkdirProcess.running) { showError("Invalid folder name"); return }
     var p = Model.joinPath(currentPath, name)
     if (p === null) { showError("Invalid folder name"); return }
-    mkdirProcess.generation = generation
-    mkdirProcess.command = cliArgs(["mkdir", "--", p])
+    mkdirProcess.command = nativeArgs(["mkdir", "--", p])
     mkdirProcess.running = true
   }
 
   // ── processes ──────────────────────────────────────────────────────────
 
-  // Locate the binary. Uses a login shell only to resolve PATH the way the
-  // user's own shell would (the installer appends ~/.filen-cli/bin there);
-  // the command text is a fixed literal with no interpolation.
+  // Locate the binary. A login shell is used only to resolve PATH the way the
+  // user's shell would (the installer appends ~/.filen-cli/bin); the command
+  // text is a fixed literal with no interpolation.
   Process {
     id: whichProcess
     running: false
@@ -398,6 +444,7 @@ Item {
         root.cliInstalled = true
         versionProcess.command = [p, "--version"]
         versionProcess.running = true
+        root.checkConfigPermissions()
       } else {
         root.cliInstalled = false
         root.cliPath = ""
@@ -412,8 +459,38 @@ Item {
     stdout: StdioCollector { id: versionOut; waitForEnd: true }
     onExited: function() {
       root.cliVersion = Model.sanitizeText(versionOut.text, 40)
-      // First real call doubles as the auth probe.
-      root.refreshQuota()
+      root.refreshQuota()   // first real call doubles as the auth probe
+    }
+  }
+
+  Process {
+    id: permProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: permOut; waitForEnd: true }
+    onExited: function() {
+      var parts = String(permOut.text || "").trim().split(" ")
+      if (parts.length < 2) { root.configWorldReadable = false; return }
+      var mode = parts[0]
+      root.configPath = parts.slice(1).join(" ")
+      // Any group/other read bit on a file holding master keys is a problem.
+      var g = parseInt(mode.charAt(mode.length - 2), 10)
+      var o = parseInt(mode.charAt(mode.length - 1), 10)
+      root.configWorldReadable = (isFinite(g) && g !== 0) || (isFinite(o) && o !== 0)
+    }
+  }
+
+  Process {
+    id: permFixProcess
+    running: false
+    command: []
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.showStatus("Credential file locked to your user only")
+        root.checkConfigPermissions()
+      } else {
+        root.showError("Could not change permissions")
+      }
     }
   }
 
@@ -427,15 +504,15 @@ Item {
     onExited: function(exitCode) {
       if (generation !== root.generation) return
       root.authChecked = true
-      var err = String(quotaErr.text || "")
+      var all = root.combinedOutput(quotaOut.text, quotaErr.text)
       if (exitCode !== 0) {
-        if (Model.isAuthError(err)) { root.signedIn = false; root.quotaLoaded = false; return }
-        root.signedIn = true
+        if (Model.isAuthError(all)) { root.signedIn = false; root.quotaLoaded = false }
+        // A non-auth failure says nothing about credentials; leave signedIn.
         return
       }
       root.signedIn = true
-      var s = Model.parseStat(quotaOut.text)
-      if (s && s.type === "drive") {
+      var s = Model.parseAbout(quotaOut.text)
+      if (s) {
         root.usedBytes = s.used
         root.totalBytes = s.total
         root.quotaLoaded = true
@@ -454,23 +531,23 @@ Item {
     onExited: function(exitCode) {
       root.listing = false
       if (generation !== root.generation) return
-      var err = String(listErr.text || "")
+      var all = root.combinedOutput(listOut.text, listErr.text)
       if (exitCode !== 0) {
-        if (Model.isAuthError(err)) {
+        if (Model.isAuthError(all)) {
           root.signedIn = false
           root.authChecked = true
           root.entries = []
           root.listError = ""
           return
         }
-        root.listError = Model.errorMessage(exitCode, err)
+        root.listError = Model.errorMessage(exitCode, all)
         root.entries = []
         root.entriesUpdated()
         return
       }
       root.signedIn = true
       root.authChecked = true
-      var parsed = Model.parseListing(listOut.text)
+      var parsed = Model.parseLsJson(listOut.text)
       if (parsed === null) {
         root.listError = "Unexpected response from the Filen CLI"
         root.entries = []
@@ -486,26 +563,11 @@ Item {
   }
 
   Process {
-    id: detailProcess
-    property int generation: 0
-    property string wantPath: ""
-    running: false
-    command: []
-    stdout: StdioCollector { id: detailOut; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (generation !== root.generation) return
-      if (wantPath !== root.detailPath) return
-      if (exitCode !== 0) { root.detailData = null; return }
-      root.detailData = Model.parseStat(detailOut.text)
-    }
-  }
-
-  Process {
     id: rmProcess
-    property int generation: 0
     property string label: ""
     running: false
     command: []
+    stdout: StdioCollector { id: rmOut; waitForEnd: true }
     stderr: StdioCollector { id: rmErr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) {
@@ -513,28 +575,28 @@ Item {
         root.list(root.currentPath, true)
         root.refreshQuota()
       } else {
-        root.showError(Model.errorMessage(exitCode, rmErr.text))
+        root.showError(Model.errorMessage(exitCode, root.combinedOutput(rmOut.text, rmErr.text)))
       }
     }
   }
 
   Process {
     id: mkdirProcess
-    property int generation: 0
     running: false
     command: []
+    stdout: StdioCollector { id: mkdirOut; waitForEnd: true }
     stderr: StdioCollector { id: mkdirErr; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.showStatus("Folder created")
         root.list(root.currentPath, true)
       } else {
-        root.showError(Model.errorMessage(exitCode, mkdirErr.text))
+        root.showError(Model.errorMessage(exitCode, root.combinedOutput(mkdirOut.text, mkdirErr.text)))
       }
     }
   }
 
-  // One Process per transfer, created on demand so several can run at once.
+  // One Process per transfer so several can run concurrently.
   Component {
     id: transferComponent
     Process {
@@ -542,9 +604,10 @@ Item {
       property var argv: []
       running: false
       command: argv
-      stderr: StdioCollector { waitForEnd: true }
+      stdout: StdioCollector { id: xferOut; waitForEnd: true }
+      stderr: StdioCollector { id: xferErr; waitForEnd: true }
       onExited: function(exitCode) {
-        root.finishTransfer(transferId, exitCode, stderr ? stderr.text : "")
+        root.finishTransfer(transferId, exitCode, root.combinedOutput(xferOut.text, xferErr.text))
         destroy()
       }
     }
@@ -559,7 +622,7 @@ Item {
   }
 
   // After sending the user to a login terminal, poll briefly so the panel
-  // flips to signed-in the moment they finish, without them reopening it.
+  // flips to signed-in the moment they finish.
   Timer {
     id: loginWatchTimer
     interval: 3000
@@ -573,7 +636,6 @@ Item {
     onRunningChanged: if (running) ticks = 0
   }
 
-  // Background quota refresh keeps the bar honest while the panel is closed.
   Timer {
     interval: root.refreshIntervalSec * 1000
     running: root.cliInstalled && root.signedIn

@@ -29,6 +29,15 @@ Panel {
   property var pendingDelete: null
   property bool newFolderOpen: false
 
+  // Remembers which row you were on in each folder, so walking back up lands
+  // the cursor on the folder you just came out of instead of resetting to the
+  // header. Keyed by path; bounded so a long session can't grow it forever.
+  property var cursorMemory: ({})
+
+  // Set by goUp(): the folder name we just left, so once the parent listing
+  // arrives we can put the cursor back on it.
+  property string pendingReturnName: ""
+
   readonly property bool overlayOpen: pendingDelete !== null
   readonly property bool editorOpen: filterActive || newFolderOpen
 
@@ -127,7 +136,6 @@ Panel {
       if (body === "entries") entryIndex = idx; else transferIndex = idx
     }
     ensureCursor()
-    syncDetail()
     scrollCursorIntoView()
   }
 
@@ -150,6 +158,7 @@ Panel {
   function enterSelected() {
     var e = selectedEntry()
     if (!e || !e.dir) return
+    rememberCursor(filen.currentPath, entryIndex)
     filen.enterDirectory(e)
     entryIndex = 0
     focusSection = "entries"
@@ -158,10 +167,26 @@ Panel {
 
   function goUp() {
     if (filen.atRoot) return
+    // Remember where we were, and aim at the folder we are stepping out of.
+    rememberCursor(filen.currentPath, entryIndex)
+    pendingReturnName = Model.basename(filen.currentPath)
     filen.goUp()
-    entryIndex = 0
     focusSection = "entries"
     clearFilter()
+  }
+
+  // Bounded per-path cursor memory (see cursorMemory above).
+  function rememberCursor(path, index) {
+    var m = cursorMemory
+    var keys = Object.keys(m)
+    if (keys.length > 60) m = ({})       // cheap reset rather than LRU bookkeeping
+    m[path] = index
+    cursorMemory = m
+  }
+
+  function recallCursor(path) {
+    var v = cursorMemory[path]
+    return (typeof v === "number" && v >= 0) ? v : 0
   }
 
   function downloadSelected(andOpen) {
@@ -184,20 +209,12 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  function syncDetail() {
-    if (view !== "browse") return
-    var e = selectedEntry()
-    if (e && !e.dir) filen.loadDetail(e)
-    else { filen.detailPath = ""; filen.detailData = null }
-  }
-
   function setRowCursor(section, index) {
     if (overlayOpen) return
     cursorActive = true
     focusSection = section
     if (section === "entries") entryIndex = index
     else if (section === "transfers") transferIndex = index
-    syncDetail()
   }
 
   function setHeaderCursor() {
@@ -289,6 +306,20 @@ Panel {
     id: filen
     settings: root.settings
     onEntriesUpdated: {
+      // Restore the cursor: prefer the folder we just stepped out of, else
+      // whatever row we were on last time we were in this folder.
+      if (root.pendingReturnName !== "") {
+        var want = root.pendingReturnName
+        root.pendingReturnName = ""
+        var found = -1
+        for (var n = 0; n < root.visibleEntries.length; n++) {
+          if (root.visibleEntries[n].name === want) { found = n; break }
+        }
+        root.entryIndex = found >= 0 ? found : root.recallCursor(filen.currentPath)
+        root.focusSection = root.visibleEntries.length > 0 ? "entries" : "header"
+        root.cursorActive = root.visibleEntries.length > 0
+        root.scrollCursorIntoView()
+      }
       root.ensureCursor()
       // A row can vanish under an open dialog (refresh, deletion elsewhere);
       // an orphaned overlay would swallow every keystroke.
@@ -298,9 +329,12 @@ Panel {
           if (filen.entries[i].name === root.pendingDelete.name) { still = true; break }
         if (!still) root.closeConfirm()
       }
-      root.syncDetail()
     }
-    onNavigated: function(path) { root.entryIndex = 0 }
+    onNavigated: function(path) {
+      // A fresh navigation (breadcrumb click / enter) starts at the remembered
+      // row for that folder; goUp() overrides this via pendingReturnName.
+      if (root.pendingReturnName === "") root.entryIndex = root.recallCursor(path)
+    }
   }
 
   IpcHandler {
@@ -311,6 +345,61 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { filen.refresh(); return "ok" }
+
+    // Navigate to an absolute drive path. Used by `omarchy-shell filen goto
+    // /Pictures` and by the test harness; the path is normalised and cannot
+    // escape the drive root.
+    function goto(path: string): string {
+      if (!filen.signedIn) return "not-signed-in"
+      filen.goTo(path)
+      return filen.currentPath
+    }
+
+    // Report the current rows (display names only) so tests can assert on
+    // what the panel is actually showing.
+    function rows(): string {
+      var out = []
+      for (var i = 0; i < root.visibleEntries.length; i++) {
+        var e = root.visibleEntries[i]
+        out.push({ name: e.display, dir: e.dir, size: e.size, kind: e.kind })
+      }
+      return JSON.stringify(out)
+    }
+
+    // Full transfer records, for diagnosing failures from the CLI.
+    function transfers(): string {
+      var out = []
+      for (var i = 0; i < filen.transfers.length; i++) {
+        var t = filen.transfers[i]
+        out.push({ kind: t.kind, label: t.label, state: t.state,
+                   error: t.error, local: t.localPath, remote: t.remotePath })
+      }
+      return JSON.stringify(out)
+    }
+
+    // Move the cursor to a row by index and act on it. Deterministic entry
+    // point for the test harness — key timing races are not a reliable way to
+    // drive a list.
+    function select(index: string): string {
+      var i = parseInt(index, 10)
+      if (!isFinite(i) || i < 0 || i >= root.visibleEntries.length) return "out-of-range"
+      root.setRowCursor("entries", i)
+      return root.visibleEntries[i].display
+    }
+
+    function activate(): string {
+      if (root.focusSection !== "entries") return "no-cursor"
+      root.activateCursor()
+      return "ok"
+    }
+
+    function downloadSelected(): string {
+      var e = root.selectedEntry()
+      if (!e) return "no-selection"
+      filen.download(e, false)
+      return e.display
+    }
+
     function status(): string {
       return JSON.stringify({
         cliInstalled: filen.cliInstalled,
@@ -465,7 +554,7 @@ Panel {
                   spacing: Style.space(2)
 
                   PanelActionButton {
-                    iconText: root.view === "transfers" ? "\udb80\udcaf" : "\udb81\udf6c"
+                    iconText: root.view === "transfers" ? "󰉋" : "󰓡"
                     tooltipText: root.view === "transfers" ? "Back to files (t)" : "Transfers (t)"
                     foreground: hero.foreground
                     fontFamily: hero.fontFamily
@@ -476,7 +565,7 @@ Panel {
 
                   PanelActionButton {
                     id: refreshButton
-                    iconText: "\udb81\udc50"
+                    iconText: "󰑐"
                     tooltipText: "Refresh (r)"
                     foreground: hero.foreground
                     fontFamily: hero.fontFamily
@@ -506,6 +595,59 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             elide: Text.ElideRight
+          }
+
+          // ── security warning: credential cache readable by others ──────
+          //
+          // The Filen CLI creates ~/.config/filen-cli/rclone/rclone.conf
+          // holding the master keys, private key and API key — and creates it
+          // mode 0644. On a shared machine any local user can read it and
+          // fully decrypt the account, which defeats the zero-knowledge
+          // model. We only stat() the file; its contents are never read.
+          CursorSurface {
+            visible: filen.configWorldReadable
+            width: parent.width
+            implicitHeight: permInner.implicitHeight + Style.spacing.rowPaddingX * 2
+            foreground: root.urgent
+
+            Column {
+              id: permInner
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(12)
+              spacing: Style.space(6)
+
+              Row {
+                spacing: Style.space(8)
+                Text {
+                  text: "󰀦"
+                  color: root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.icon
+                }
+                Text {
+                  text: "Credential file is readable by other users"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+              }
+              Text {
+                width: parent.width
+                text: "The Filen CLI stored your master keys and API key in a world-readable file. Anyone with an account on this machine could decrypt your drive."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              Button {
+                text: "Lock it to my user only"
+                iconText: "󰌾"
+                foreground: root.foreground
+                onClicked: filen.hardenConfigPermissions()
+              }
+            }
           }
 
           // ── setup: CLI missing ─────────────────────────────────────────
@@ -543,13 +685,13 @@ Panel {
                 spacing: Style.space(6)
                 Button {
                   text: "Installation docs"
-                  iconText: "\udb80\udf9f"
+                  iconText: "󰖟"
                   foreground: root.foreground
                   onClicked: filen.openInstallDocs()
                 }
                 Button {
                   text: "Recheck"
-                  iconText: "\udb81\udc50"
+                  iconText: "󰑐"
                   foreground: root.foreground
                   onClicked: { filen.cliChecked = false; filen.start() }
                 }
@@ -590,7 +732,7 @@ Panel {
               }
               Button {
                 text: "Sign in with the Filen CLI"
-                iconText: "\udb80\udd0d"
+                iconText: "󰌾"
                 foreground: root.foreground
                 onClicked: filen.openLoginTerminal()
               }
@@ -824,11 +966,12 @@ Panel {
                       Layout.fillWidth: true
                     }
 
-                    // Size for the focused file only — a per-row stat would
-                    // be one CLI process per entry.
+                    // Size comes from the listing itself (rclone lsjson
+                    // returns it), so every row can show it with no extra
+                    // process per entry.
                     Text {
-                      visible: entryRow.hasCursor && filen.detailData && filen.detailData.type === "file"
-                      text: filen.detailData ? Model.formatSize(filen.detailData.size) : ""
+                      visible: !modelData.dir && modelData.size !== null
+                      text: Model.formatSize(modelData.size)
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -847,7 +990,7 @@ Panel {
                       spacing: Style.space(1)
 
                       PanelActionButton {
-                        iconText: "\udb81\udc1a"
+                        iconText: "󰇚"
                         tooltipText: "Download (d)"
                         foreground: root.foreground
                         fontFamily: root.fontFamily
@@ -857,7 +1000,7 @@ Panel {
                       }
                       PanelActionButton {
                         visible: Model.isPreviewable(modelData)
-                        iconText: "\udb80\udd0f"
+                        iconText: "󰏌"
                         tooltipText: "Open (o)"
                         foreground: root.foreground
                         fontFamily: root.fontFamily
@@ -931,23 +1074,29 @@ Panel {
                     spacing: Style.space(8)
 
                     Text {
+                      id: transferGlyph
                       text: modelData.state === "running"
-                              ? (modelData.kind === "download" ? "\udb81\udc1a" : "\udb81\udd52")
-                              : modelData.state === "done" ? "\udb80\udd0c"
-                              : modelData.state === "canceled" ? "\udb80\udd59" : "\udb80\udd5a"
+                              ? (modelData.kind === "download" ? "󰇚" : "󰕒")
+                              : modelData.state === "done" ? "󰄬"
+                              : modelData.state === "canceled" ? "󰅖" : "󰀦"
                       color: modelData.state === "done" ? Color.accent
                            : modelData.state === "failed" ? root.urgent : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.icon
                       Layout.preferredWidth: Style.space(16)
 
-                      NumberAnimation on opacity {
+                      // Pulse only while running. An explicit SequentialAnimation
+                      // (rather than `NumberAnimation on opacity`) lets us restore
+                      // full opacity when it stops, instead of freezing on the
+                      // last interpolated value.
+                      SequentialAnimation {
                         running: modelData.state === "running"
-                        from: 1.0; to: 0.35; duration: 700
                         loops: Animation.Infinite
-                        easing.type: Easing.InOutQuad
+                        alwaysRunToEnd: false
+                        onStopped: transferGlyph.opacity = 1.0
+                        NumberAnimation { target: transferGlyph; property: "opacity"; from: 1.0; to: 0.35; duration: 700; easing.type: Easing.InOutQuad }
+                        NumberAnimation { target: transferGlyph; property: "opacity"; from: 0.35; to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
                       }
-                      onRunningChanged: if (!running) opacity = 1.0
                     }
 
                     Column {
@@ -979,7 +1128,7 @@ Panel {
 
                     PanelActionButton {
                       visible: transferRow.hasCursor && modelData.state === "running"
-                      iconText: "\udb80\udd56"
+                      iconText: "󰅖"
                       tooltipText: "Cancel"
                       foreground: root.foreground
                       fontFamily: root.fontFamily
@@ -995,7 +1144,7 @@ Panel {
             Button {
               visible: filen.transfers.length > 0
               text: "Clear finished"
-              iconText: "\udb81\udf79"
+              iconText: "󰆴"
               foreground: root.foreground
               onClicked: filen.clearFinishedTransfers()
             }

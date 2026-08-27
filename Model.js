@@ -37,14 +37,22 @@ function sanitizeText(value, limit) {
 }
 
 // A name is *usable* (safe to send back to the CLI as part of a path) only if
-// it survives sanitizing unchanged in the ways that matter. We reject rather
+// it cannot change the meaning of a path or an argv element. We reject rather
 // than repair: acting on a path we had to rewrite is how you delete the wrong
 // file.
+//
+// Note the deliberate narrowness. Because commands are executed as an argv
+// ARRAY (never a shell string) and native verbs get `--`, the only characters
+// that can actually change meaning are NUL (terminates a C string) and "/"
+// (path separator). Tabs, newlines, escapes and leading dashes are legal on
+// the server and DO occur in real drives — rejecting them would make those
+// files invisible in the panel and impossible to delete, which is worse than
+// displaying them. They are neutralised at render time by sanitizeText().
 function isUsableName(name) {
   var s = String(name === undefined || name === null ? "" : name);
   if (s === "" || s === "." || s === "..") return false;
   if (s.length > 255) return false;
-  if (/[\u0000-\u001F\u007F]/.test(s)) return false;   // control chars
+  if (s.indexOf("\u0000") !== -1) return false;        // NUL only
   if (s.indexOf("/") !== -1) return false;             // path separator
   return true;
 }
@@ -176,6 +184,55 @@ function toNumber(v) {
   return isFinite(n) ? n : null;
 }
 
+// `filen rclone lsjson filen:<path>` => array of
+//   {Path, Name, Size, MimeType, ModTime, IsDir, ID}
+// This is the preferred listing source: one call yields sizes and dates,
+// where the native `ls --json` returns names only.
+//
+// ModTime is an RFC3339 string, NOT epoch ms — parsed here into ms so the
+// rest of the plugin sees one time representation.
+function parseLsJson(text) {
+  var data = parseJson(text);
+  if (!(data instanceof Array)) return null;
+  var out = [];
+  for (var i = 0; i < data.length && out.length < MAX_ENTRIES; i++) {
+    var e = data[i];
+    if (!e || typeof e !== "object") continue;
+    var name = typeof e.Name === "string" ? e.Name : "";
+    if (!isUsableName(name)) continue;      // drops "..", "a/b", control bytes
+    var isDir = e.IsDir === true;
+    var size = toNumber(e.Size);
+    out.push({
+      name: name,
+      display: sanitizeText(name),
+      dir: isDir,
+      kind: isDir ? "directory" : kindOf(name),
+      size: isDir || size === null || size < 0 ? null : size,
+      modified: parseRfc3339(e.ModTime),
+      mime: typeof e.MimeType === "string" ? sanitizeText(e.MimeType, 64) : ""
+    });
+  }
+  return out;
+}
+
+// Bounded RFC3339 -> epoch ms. Returns null rather than NaN on anything odd.
+function parseRfc3339(value) {
+  var s = String(value || "");
+  if (s === "" || s.length > 64) return null;
+  var ms = Date.parse(s);
+  return isFinite(ms) && ms > 0 ? ms : null;
+}
+
+// `filen rclone about filen: --json` => {total, used, free}
+function parseAbout(text) {
+  var d = parseJson(text);
+  if (!d || typeof d !== "object") return null;
+  var used = toNumber(d.used);
+  var total = toNumber(d.total);
+  if (used === null || total === null || total <= 0) return null;
+  return { used: used, total: total, free: toNumber(d.free) };
+}
+
 // ---------------------------------------------------------------- file kinds
 
 var IMAGE_EXT = ["png","jpg","jpeg","gif","webp","bmp","avif","jxl","tiff","tif","ico","svg"];
@@ -208,16 +265,16 @@ function kindOf(name) {
 
 // Nerd Font glyphs, matching the vocabulary the first-party panels use.
 function iconFor(entry) {
-  if (!entry) return "\udb80\udc94";
-  if (entry.dir) return "\udb83\udc4b";           // 󰉋 folder
+  if (!entry) return "󰈤";
+  if (entry.dir) return "󰉋";
   switch (entry.kind) {
-    case "image":    return "\udb80\udeE9";        // 󰋩
-    case "video":    return "\udb81\udd6d";        // 󰵭
-    case "audio":    return "\udb81\udd1e";        // 󰴞
-    case "document": return "\udb85\udc11";        // 󰈙-ish
-    case "text":     return "\udb80\udc15";        // 󰀕
-    case "archive":  return "\udb82\udd3a";        // 󰤺
-    default:         return "\udb80\udc94";        // 󰂔 generic file
+    case "image":    return "󰋩";
+    case "video":    return "󰕧";
+    case "audio":    return "󰎇";
+    case "document": return "󰈦";
+    case "text":     return "󰈙";
+    case "archive":  return "󰗀";
+    default:         return "󰈤";
   }
 }
 
@@ -365,6 +422,42 @@ function localTargetName(name) {
   return isUsableName(name) ? name : null;
 }
 
+// The filename we actually write to LOCAL disk.
+//
+// A remote name is attacker-controlled, and writing it verbatim would carry
+// the attack onto the local filesystem: a bidi override (U+202E) makes
+// "ev<RLO>gnp.exe" render as "evexe.gnp" in every file manager and terminal,
+// hiding the real extension. Control characters similarly break shell output
+// and confuse scripts that later touch the download directory.
+//
+// So the REMOTE path stays byte-exact (we must fetch the right object), while
+// the LOCAL name is stripped of anything deceptive. The visible extension is
+// preserved so the correct application still opens it.
+function safeLocalName(name) {
+  var s = String(name === undefined || name === null ? "" : name);
+  // bidi controls: the extension-spoofing vector
+  s = s.replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "");
+  // zero-width joiners/spaces
+  s = s.replace(/[\u200B-\u200D\uFEFF]/g, "");
+  // C0/C1 controls and DEL -> underscore, so words stay separated
+  s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, "_");
+  // path separators can never appear in a basename
+  s = s.replace(/\//g, "_");
+  // collapse the runs of underscores that substitution can create
+  s = s.replace(/_{2,}/g, "_");
+  // strip leading separators/dots/dashes: a leading dot would hide the file,
+  // a leading dash trips CLI tools, and a leading underscore is just noise
+  s = s.replace(/^[._\-]+/, "");
+  s = s.replace(/^\s+|\s+$/g, "");
+  if (s === "" || s === "." || s === "..") return null;
+  if (s.length > 200) {
+    var dot = s.lastIndexOf(".");
+    var ext = dot > 0 && s.length - dot <= 12 ? s.slice(dot) : "";
+    s = s.slice(0, 200 - ext.length) + ext;
+  }
+  return s;
+}
+
 // ---------------------------------------------------------------- transfers
 
 function makeTransfer(id, kind, label, remotePath, localPath) {
@@ -407,6 +500,9 @@ if (typeof module !== "undefined" && module.exports) {
     parseJson: parseJson,
     parseListing: parseListing,
     parseStat: parseStat,
+    parseLsJson: parseLsJson,
+    parseRfc3339: parseRfc3339,
+    parseAbout: parseAbout,
     extensionOf: extensionOf,
     kindOf: kindOf,
     iconFor: iconFor,
@@ -424,6 +520,7 @@ if (typeof module !== "undefined" && module.exports) {
     filterEntries: filterEntries,
     validatedDownloadDir: validatedDownloadDir,
     localTargetName: localTargetName,
+    safeLocalName: safeLocalName,
     makeTransfer: makeTransfer,
     transferSummary: transferSummary
   };

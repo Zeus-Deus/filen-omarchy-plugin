@@ -53,9 +53,17 @@ test("isUsableName rejects traversal and separators", () => {
   assert.strictEqual(M.isUsableName(""), false);
 });
 
-test("isUsableName rejects control characters and NUL", () => {
+test("isUsableName rejects only what can change path meaning", () => {
+  // NUL and "/" are the only genuinely dangerous characters, because commands
+  // are argv arrays and never shell strings.
   assert.strictEqual(M.isUsableName("a\u0000b"), false);
-  assert.strictEqual(M.isUsableName("a\nb"), false);
+  assert.strictEqual(M.isUsableName("a/b"), false);
+  // Legal-but-ugly names must stay usable, or the file becomes invisible and
+  // undeletable in the panel. These exist in the live test account.
+  assert.strictEqual(M.isUsableName("weird\ttab.png"), true);
+  assert.strictEqual(M.isUsableName("ev\u202Egnp.exe"), true);
+  assert.strictEqual(M.isUsableName("-leading-dash.png"), true);
+  assert.strictEqual(M.isUsableName("line\nbreak.txt"), true);
 });
 
 test("isUsableName rejects over-long names", () => {
@@ -348,4 +356,153 @@ test("makeTransfer sanitizes its label", () => {
   assert.strictEqual(t.label.indexOf("\u202E"), -1);
   assert.strictEqual(t.label.indexOf("\u0000"), -1);
   assert.strictEqual(t.state, "running");
+});
+
+// ─────────────────────────────────────────────── rclone lsjson (real shapes)
+// The JSON below is verbatim output captured from `filen rclone lsjson`
+// against a live account on 2026-08-27 with CLI v0.2.7.
+
+const REAL_LSJSON = `[
+{"Path":"Documents","Name":"Documents","Size":-1,"MimeType":"inode/directory","ModTime":"2026-08-27T23:04:54.548+02:00","IsDir":true,"ID":"2214b8ed-3e29-4786-b089-44be46179b2a"},
+{"Path":"Pictures","Name":"Pictures","Size":-1,"MimeType":"inode/directory","ModTime":"2026-08-27T23:04:55.061+02:00","IsDir":true,"ID":"7579b738-20c1-403d-8701-0a086b0c54bc"},
+{"Path":"README.txt","Name":"README.txt","Size":40,"MimeType":"text/plain","ModTime":"2026-08-27T23:04:48.186+02:00","IsDir":false,"ID":"5001256a-1933-4f75-b50b-7fd2da6be00d"}
+]`;
+
+test("parseLsJson reads the real rclone listing", () => {
+  const out = M.parseLsJson(REAL_LSJSON);
+  assert.strictEqual(out.length, 3);
+  assert.strictEqual(out[0].dir, true);
+  assert.strictEqual(out[0].size, null);            // -1 for dirs -> null
+  assert.strictEqual(out[2].name, "README.txt");
+  assert.strictEqual(out[2].size, 40);
+  assert.strictEqual(out[2].kind, "text");
+  assert.ok(out[2].modified > 1_700_000_000_000);   // RFC3339 -> epoch ms
+});
+
+test("parseLsJson drops entries whose names are unusable", () => {
+  const hostile = JSON.stringify([
+    { Name: "ok.txt", Size: 1, IsDir: false, ModTime: "2026-01-01T00:00:00Z" },
+    { Name: "..", Size: 1, IsDir: true },
+    { Name: "a/b", Size: 1, IsDir: false },
+    { Name: "nul\u0000byte", Size: 1, IsDir: false },
+    { Name: "", Size: 1, IsDir: false }
+  ]);
+  const out = M.parseLsJson(hostile);
+  assert.deepStrictEqual(out.map(e => e.name), ["ok.txt"]);
+});
+
+test("parseLsJson keeps hostile-but-legal names and sanitizes the display", () => {
+  // These two exist in the live test account.
+  const out = M.parseLsJson(JSON.stringify([
+    { Name: "ev\u202Egnp.exe", Size: 18, IsDir: false },
+    { Name: "weird\ttab.png", Size: 17, IsDir: false },
+    { Name: "-leading-dash.png", Size: 179, IsDir: false }
+  ]));
+  assert.strictEqual(out.length, 3);
+  // raw name preserved for the CLI call...
+  assert.strictEqual(out[0].name, "ev\u202Egnp.exe");
+  // ...but the rendered form has no bidi override
+  assert.strictEqual(out[0].display.indexOf("\u202E"), -1);
+  // tab collapsed to a space in display, raw kept
+  assert.strictEqual(out[1].display, "weird tab.png");
+  assert.strictEqual(out[1].name, "weird\ttab.png");
+  // leading dash is legal; it is never argv-leading because we pass `--`
+  assert.strictEqual(out[2].name, "-leading-dash.png");
+});
+
+test("parseLsJson rejects non-arrays and garbage", () => {
+  assert.strictEqual(M.parseLsJson("{}"), null);
+  assert.strictEqual(M.parseLsJson("not json"), null);
+  assert.strictEqual(M.parseLsJson(""), null);
+  assert.deepStrictEqual(M.parseLsJson("[]"), []);
+});
+
+test("parseLsJson tolerates missing fields", () => {
+  const out = M.parseLsJson(JSON.stringify([{ Name: "x.txt" }]));
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].size, null);
+  assert.strictEqual(out[0].modified, null);
+  assert.strictEqual(out[0].dir, false);
+});
+
+test("parseRfc3339 handles real timestamps and junk", () => {
+  assert.ok(M.parseRfc3339("2026-08-27T23:04:48.186+02:00") > 0);
+  assert.ok(M.parseRfc3339("2026-01-01T00:00:00Z") > 0);
+  assert.strictEqual(M.parseRfc3339("nonsense"), null);
+  assert.strictEqual(M.parseRfc3339(""), null);
+  assert.strictEqual(M.parseRfc3339("x".repeat(200)), null);
+});
+
+test("parseAbout reads the real quota shape", () => {
+  // verbatim from `filen rclone about filen: --json`
+  const s = M.parseAbout('{\n\t"total": 42949672960,\n\t"used": 96,\n\t"free": 42949672864\n}');
+  assert.strictEqual(s.total, 42949672960);
+  assert.strictEqual(s.used, 96);
+  assert.strictEqual(s.free, 42949672864);
+});
+
+test("parseAbout fails closed on a zero total", () => {
+  assert.strictEqual(M.parseAbout('{"total":0,"used":5}'), null);
+  assert.strictEqual(M.parseAbout("garbage"), null);
+});
+
+test("sortEntries orders the real listing correctly", () => {
+  const out = M.sortEntries(M.parseLsJson(REAL_LSJSON));
+  assert.deepStrictEqual(out.map(e => e.name), ["Documents", "Pictures", "README.txt"]);
+});
+
+// ─────────────────────────────────────────────── local write safety
+// Regression tests for a real vulnerability found during live testing: the
+// plugin downloaded "ev<U+202E>gnp.exe" from the drive and wrote that exact
+// name to ~/Downloads, where a file manager renders it as "evexe.gnp" —
+// hiding the true .exe extension. Remote paths stay exact; local names don't.
+
+test("safeLocalName strips the bidi extension-spoofing attack", () => {
+  const evil = "ev\u202Egnp.exe";           // exists in the live test account
+  const safe = M.safeLocalName(evil);
+  assert.strictEqual(safe.indexOf("\u202E"), -1);
+  assert.strictEqual(safe, "evgnp.exe");
+  // the true extension survives, so the right app still opens it
+  assert.ok(safe.endsWith(".exe"));
+});
+
+test("safeLocalName strips every bidi and zero-width control", () => {
+  for (const cp of ["\u200E","\u200F","\u202A","\u202B","\u202C","\u202D","\u202E",
+                    "\u2066","\u2067","\u2068","\u2069","\u200B","\u200C","\u200D","\uFEFF"]) {
+    const out = M.safeLocalName("a" + cp + "b.txt");
+    assert.strictEqual(out.indexOf(cp), -1, `leaked ${escape(cp)}`);
+  }
+});
+
+test("safeLocalName replaces control characters with underscores", () => {
+  assert.strictEqual(M.safeLocalName("weird\ttab.png"), "weird_tab.png");
+  assert.strictEqual(M.safeLocalName("line\nbreak.txt"), "line_break.txt");
+  assert.strictEqual(M.safeLocalName("nul\u0000byte.bin"), "nul_byte.bin");
+});
+
+test("safeLocalName neutralises leading dot and dash", () => {
+  // a leading dot hides the file; a leading dash is read as a flag by tools
+  assert.strictEqual(M.safeLocalName("-leading-dash.png"), "leading-dash.png");
+  assert.strictEqual(M.safeLocalName(".hidden.txt"), "hidden.txt");
+  assert.strictEqual(M.safeLocalName("...."), null);
+});
+
+test("safeLocalName can never escape the download directory", () => {
+  assert.strictEqual(M.safeLocalName("../../etc/passwd"), "etc_passwd");
+  assert.strictEqual(M.safeLocalName("/abs/path"), "abs_path");
+  assert.strictEqual(M.safeLocalName(".."), null);
+  assert.strictEqual(M.safeLocalName(""), null);
+});
+
+test("safeLocalName truncates long names but keeps the extension", () => {
+  const long = "x".repeat(400) + ".png";
+  const out = M.safeLocalName(long);
+  assert.ok(out.length <= 200);
+  assert.ok(out.endsWith(".png"));
+});
+
+test("safeLocalName leaves ordinary names untouched", () => {
+  assert.strictEqual(M.safeLocalName("invoice-0184.pdf"), "invoice-0184.pdf");
+  assert.strictEqual(M.safeLocalName("Ünïcode ファイル.txt"), "Ünïcode ファイル.txt");
+  assert.strictEqual(M.safeLocalName("sunset.png"), "sunset.png");
 });
