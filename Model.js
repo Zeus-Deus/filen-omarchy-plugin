@@ -406,6 +406,19 @@ function isNotFoundError(stderr) {
       || s.indexOf("Failed to find item") !== -1;
 }
 
+// Every `filen rclone ...` invocation REWRITES ~/.config/filen-cli/rclone/
+// rclone.conf as it starts. When two invocations overlap, one can read the
+// file while the other is mid-write and fail with:
+//   CRITICAL: Failed to create file system for "filen:/x":
+//   didn't find section in config file ("filen")
+// This is transient and entirely a local-file race — not an auth failure and
+// not a missing path — so the caller should simply retry rather than show it.
+function isConfigRaceError(text) {
+  var s = String(text || "");
+  return s.indexOf("didn't find section in config file") !== -1
+      || s.indexOf("Failed to create file system") !== -1;
+}
+
 // Oversized/failed transfer detection, mirroring the passpage plugin: head
 // closing the pipe makes the producer fail its write.
 function oversized(exitCode, output) {
@@ -567,6 +580,7 @@ if (typeof module !== "undefined" && module.exports) {
     errorMessage: errorMessage,
     isAuthError: isAuthError,
     isNotFoundError: isNotFoundError,
+    isConfigRaceError: isConfigRaceError,
     oversized: oversized,
     sortEntries: sortEntries,
     sameEntries: sameEntries,

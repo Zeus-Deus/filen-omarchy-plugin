@@ -90,6 +90,13 @@ Item {
   // sign-out) so a late reply can never repaint a newer view.
   property int generation: 0
 
+  // Serialisation + retry state for the rclone.conf rewrite race (see
+  // Model.isConfigRaceError). Only one rclone invocation runs at a time for
+  // metadata; transfers are separate processes and tolerate the retry.
+  property bool quotaAfterList: false
+  property int listRetries: 0
+  property int quotaRetries: 0
+
   readonly property bool busy: listing || quotaProcess.running
   readonly property real quotaFraction: Model.formatPercent(usedBytes, totalBytes)
   readonly property bool quotaHigh: quotaFraction >= 0.9
@@ -188,8 +195,12 @@ Item {
 
   function refresh() {
     if (!cliInstalled) { start(); return }
-    refreshQuota()
     list(currentPath, true)
+    // Quota is chained after the listing completes, never fired alongside it:
+    // each `filen rclone` run rewrites rclone.conf on startup, and two
+    // overlapping runs can catch the file mid-write ("didn't find section in
+    // config file"). Serialising removes the race at the source.
+    quotaAfterList = true
     checkConfigPermissions()
   }
 
@@ -585,10 +596,17 @@ Item {
       root.authChecked = true
       var all = root.combinedOutput(quotaOut.text, quotaErr.text)
       if (exitCode !== 0) {
-        if (Model.isAuthError(all)) { root.signedIn = false; root.quotaLoaded = false }
+        if (Model.isAuthError(all)) { root.signedIn = false; root.quotaLoaded = false; return }
+        if (Model.isConfigRaceError(all) && root.quotaRetries < 3) {
+          root.quotaRetries++
+          quotaRetryTimer.restart()
+          return
+        }
+        root.quotaRetries = 0
         // A non-auth failure says nothing about credentials; leave signedIn.
         return
       }
+      root.quotaRetries = 0
       root.signedIn = true
       var s = Model.parseAbout(quotaOut.text)
       if (s) {
@@ -619,6 +637,14 @@ Item {
           root.listError = ""
           return
         }
+        // Transient local-config race: retry a couple of times before
+        // surfacing anything to the user.
+        if (Model.isConfigRaceError(all) && root.listRetries < 3) {
+          root.listRetries++
+          listRetryTimer.restart()
+          return
+        }
+        root.listRetries = 0
         root.listError = Model.errorMessage(exitCode, all)
         root.entries = []
         root.entriesUpdated()
@@ -637,7 +663,9 @@ Item {
       if (!Model.sameEntries(sorted, root.entries)) root.entries = sorted
       root.listLoaded = true
       root.listError = ""
+      root.listRetries = 0
       root.entriesUpdated()
+      root.runChainedQuota()
     }
   }
 
@@ -715,7 +743,27 @@ Item {
     }
   }
 
+  // Run the quota probe only once the listing process has exited, so the two
+  // rclone invocations never overlap.
+  function runChainedQuota() {
+    if (!quotaAfterList) return
+    quotaAfterList = false
+    Qt.callLater(root.refreshQuota)
+  }
+
   // ── timers ─────────────────────────────────────────────────────────────
+
+  Timer {
+    id: listRetryTimer
+    interval: 400
+    onTriggered: root.list(root.currentPath, true)
+  }
+
+  Timer {
+    id: quotaRetryTimer
+    interval: 400
+    onTriggered: root.refreshQuota()
+  }
 
   Timer {
     id: statusTimer

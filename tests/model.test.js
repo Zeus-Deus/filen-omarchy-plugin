@@ -558,3 +558,26 @@ test("formatSpeed and formatEta", () => {
   assert.strictEqual(M.formatEta(7200), "2h left");
   assert.strictEqual(M.formatEta(null), "");
 });
+
+// ─────────────────────────────────────────────── rclone.conf race
+// Every `filen rclone ...` run rewrites rclone.conf as it starts. Two
+// overlapping runs (the plugin used to fire quota + listing together) can
+// catch it mid-write. Verbatim message observed on this machine:
+
+const RACE_MSG = '2026/08/27 23:31:37 CRITICAL: Failed to create file system for "filen:/Pictures": didn\'t find section in config file ("filen")';
+
+test("isConfigRaceError recognises the real message", () => {
+  assert.strictEqual(M.isConfigRaceError(RACE_MSG), true);
+});
+
+test("isConfigRaceError does not swallow real failures", () => {
+  assert.strictEqual(M.isConfigRaceError("No such file or directory"), false);
+  assert.strictEqual(M.isConfigRaceError("Failed to read input from terminal"), false);
+  assert.strictEqual(M.isConfigRaceError(""), false);
+  assert.strictEqual(M.isConfigRaceError(null), false);
+});
+
+test("the race message is not mistaken for an auth failure", () => {
+  // critical: if this classified as auth, the panel would falsely sign you out
+  assert.strictEqual(M.isAuthError(RACE_MSG), false);
+});
