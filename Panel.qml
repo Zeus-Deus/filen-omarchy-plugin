@@ -537,16 +537,25 @@ Panel {
         else if (root.ready) root.requestDeleteSelected()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      // Backspace is the other habitual "go up" key alongside Left.
+      Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_Backspace && !root.editorOpen && !root.overlayOpen
+            && root.view === "browse") {
+          root.goUp()
+          event.accepted = true
+        }
+      }
       onTextKey: function(t) {
         var k = t.toLowerCase()
         if (k === "r") filen.refresh()
         else if (k === "/") root.startFilter()
-        else if (k === "u") root.goUp()
         else if (k === "d") root.downloadSelected(false)
         else if (k === "o") root.downloadSelected(true)
         else if (k === "n") root.startNewFolder()
         else if (k === "t") root.toggleView()
         else if (k === "w") filen.openWebDrive()
+        else if (k === "u") filen.pickAndUpload()
+        else if (k === "p") filen.uploadFromClipboard()
         else if (k === "c" && root.view === "transfers") filen.clearFinishedTransfers()
         else if (k === "y") {
           var e = root.selectedEntry()
@@ -597,6 +606,16 @@ Panel {
               trailingControl: Component {
                 Row {
                   spacing: Style.space(2)
+
+                  PanelActionButton {
+                    visible: root.ready && root.view === "browse"
+                    iconText: "󰕒"
+                    tooltipText: "Upload files here (u)"
+                    foreground: hero.foreground
+                    fontFamily: hero.fontFamily
+                    hasCursor: false
+                    onClicked: filen.pickAndUpload()
+                  }
 
                   PanelActionButton {
                     iconText: root.view === "transfers" ? "󰉋" : "󰓡"
@@ -1231,7 +1250,7 @@ Panel {
             width: parent.width
             text: root.view === "transfers"
               ? "\u21c5 move  \u00b7  enter open  \u00b7  x cancel  \u00b7  c clear  \u00b7  t files"
-              : "\u21c5 move  \u00b7  \u2192 enter  \u00b7  \u2190 up  \u00b7  d download  \u00b7  o open  \u00b7  / filter  \u00b7  n new  \u00b7  y copy path  \u00b7  x delete  \u00b7  t transfers"
+              : "\u21c5 move  \u00b7  \u2192 enter  \u00b7  \u2190 up  \u00b7  o open  \u00b7  d download  \u00b7  u upload  \u00b7  p paste  \u00b7  / filter  \u00b7  n new  \u00b7  y copy path  \u00b7  x delete  \u00b7  t transfers"
             color: Qt.darker(root.foreground, 2.4)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

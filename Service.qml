@@ -323,6 +323,46 @@ Item {
     startTransfer(id, rcloneTransferArgs(["copyto", p, remoteUrl(destRemote)]))
   }
 
+  // Open the desktop file chooser and upload whatever comes back. zenity is
+  // the GTK portal's own dialog, so it matches the rest of the desktop and
+  // needs no bespoke UI. Multiple selections are separated by newlines.
+  function pickAndUpload() {
+    if (!signedIn || pickProcess.running) return
+    pickProcess.command = ["zenity", "--file-selection", "--multiple",
+                           "--separator=\n", "--title=Upload to Filen"]
+    pickProcess.running = true
+  }
+
+  // Upload whatever local file paths are on the clipboard. This is how a
+  // file dragged from a file manager arrives: dragging onto a Wayland
+  // layer-shell surface is not something Quickshell can accept, so copying
+  // the file (Ctrl+C in Nautilus) and pressing `p` here is the supported
+  // equivalent. Handles both plain paths and file:// URI lists.
+  function uploadFromClipboard() {
+    if (!signedIn || clipProcess.running) return
+    clipProcess.command = ["wl-paste", "--no-newline"]
+    clipProcess.running = true
+  }
+
+  function uploadPathList(text) {
+    var lines = String(text || "").split("\n")
+    var started = 0
+    for (var i = 0; i < lines.length && started < 20; i++) {
+      var raw = lines[i].replace(/^\s+|\s+$/g, "")
+      if (raw === "") continue
+      // Accept "file:///path" (URI list from a file manager) or a bare path.
+      if (raw.indexOf("file://") === 0) {
+        raw = raw.slice(7)
+        try { raw = decodeURIComponent(raw) } catch (e) { continue }
+      }
+      if (raw.charAt(0) !== "/") continue
+      upload(raw)
+      started++
+    }
+    if (started === 0) showError("No file paths on the clipboard")
+    else showStatus("Uploading " + started + (started === 1 ? " file" : " files"))
+  }
+
   function startTransfer(id, argv) {
     // `filen rclone ...` forks a separate rclone binary as its child, and both
     // inherit the SHELL's process group — so signalling just the `filen` pid
@@ -684,6 +724,31 @@ Item {
       } else {
         root.showError(Model.errorMessage(exitCode, root.combinedOutput(rmOut.text, rmErr.text)))
       }
+    }
+  }
+
+  // The desktop file chooser. Its stdout is a newline-separated path list.
+  Process {
+    id: pickProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: pickOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      // exit 1 = the user cancelled the dialog; that is not an error.
+      if (exitCode !== 0) return
+      root.uploadPathList(pickOut.text)
+    }
+  }
+
+  // Clipboard read for the "copy in the file manager, paste here" flow.
+  Process {
+    id: clipProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: clipOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { root.showError("Clipboard is empty"); return }
+      root.uploadPathList(clipOut.text)
     }
   }
 
