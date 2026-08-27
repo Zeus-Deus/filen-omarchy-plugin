@@ -581,3 +581,79 @@ test("the race message is not mistaken for an auth failure", () => {
   // critical: if this classified as auth, the panel would falsely sign you out
   assert.strictEqual(M.isAuthError(RACE_MSG), false);
 });
+
+// ─────────────────────────────────────────────── error message quality
+// rclone dumps multi-line, timestamped logs. The panel must show one useful
+// sentence, never the raw stream. Verbatim capture from a bad path:
+
+const REAL_NOTFOUND = `[
+2026/08/27 23:39:50 ERROR : error listing: directory not found
+2026/08/27 23:39:50 NOTICE: Failed to lsjson with 2 errors: last error was: directory not found
+]`;
+
+test("errorMessage turns a not-found dump into one sentence", () => {
+  const msg = M.errorMessage(1, REAL_NOTFOUND);
+  assert.strictEqual(msg, "That folder no longer exists");
+  assert.strictEqual(msg.indexOf("2026/"), -1);   // no timestamps
+  assert.strictEqual(msg.indexOf("\n"), -1);      // single line
+});
+
+test("isNotFoundError recognises rclone's phrasing", () => {
+  assert.strictEqual(M.isNotFoundError(REAL_NOTFOUND), true);
+  assert.strictEqual(M.isNotFoundError("object not found"), true);
+  assert.strictEqual(M.isNotFoundError("something else"), false);
+});
+
+test("errorMessage strips rclone log decoration from unknown errors", () => {
+  const msg = M.errorMessage(1, "2026/08/27 23:39:50 ERROR : quota exceeded on server");
+  assert.strictEqual(msg, "quota exceeded on server");
+});
+
+test("errorMessage prefers the informative line over a generic first line", () => {
+  const dump = "[\nstarting transfer\n2026/01/01 00:00:00 ERROR : permission denied\n]";
+  assert.strictEqual(M.errorMessage(1, dump), "permission denied");
+});
+
+test("errorMessage still classifies auth and race before anything else", () => {
+  assert.strictEqual(M.errorMessage(1, "Failed to read input from terminal"),
+                     "Not signed in to Filen");
+  assert.strictEqual(M.errorMessage(1, 'didn\'t find section in config file ("filen")'),
+                     "Filen CLI config was busy \u2014 try again");
+});
+
+test("errorMessage falls back to the exit code when there is nothing to show", () => {
+  assert.strictEqual(M.errorMessage(7, ""), "Filen CLI failed (exit 7)");
+  assert.strictEqual(M.errorMessage(7, "[\n]"), "Filen CLI failed (exit 7)");
+});
+
+// ─────────────────────────────────────────────── offline vs signed out
+// With no network the CLI cannot validate the stored session, falls back to
+// prompting, finds no TTY, and prints the SAME message as being signed out.
+// Confusing the two would show a login button (implying the session was lost)
+// every time Wi-Fi drops. Captured from `unshare -n`:
+
+const OFFLINE_OUTPUT = "✘ Failed to read input from terminal. Please ensure that the terminal supports interactive input.";
+
+test("the offline message is textually identical to signed-out", () => {
+  // documents WHY a connectivity probe is required — text alone cannot decide
+  assert.strictEqual(M.isAuthError(OFFLINE_OUTPUT), true);
+  assert.strictEqual(M.isNetworkError(OFFLINE_OUTPUT), false);
+});
+
+test("isNetworkError recognises explicit transport failures", () => {
+  for (const s of ["dial tcp 1.2.3.4:443: connect: connection refused",
+                   "lookup gateway.filen.io: no such host",
+                   "network is unreachable",
+                   "Temporary failure in name resolution",
+                   "net/http: TLS handshake timeout",
+                   "i/o timeout",
+                   "error sending request for url"]) {
+    assert.strictEqual(M.isNetworkError(s), true, `missed: ${s}`);
+  }
+});
+
+test("isNetworkError does not fire on ordinary failures", () => {
+  assert.strictEqual(M.isNetworkError("directory not found"), false);
+  assert.strictEqual(M.isNetworkError("Failed to read input from terminal"), false);
+  assert.strictEqual(M.isNetworkError(""), false);
+});

@@ -60,6 +60,12 @@ Item {
   property bool signedIn: false
   property bool authChecked: false
 
+  // Offline is NOT the same as signed out, but the CLI reports both with the
+  // same message (see Model.isNetworkError). When an auth-looking failure
+  // arrives we probe connectivity before deciding which one to show.
+  property bool offline: false
+  property string pendingAuthFailure: ""
+
   // Security posture of the CLI's own credential cache.
   property bool configWorldReadable: false
   property string configPath: ""
@@ -103,7 +109,7 @@ Item {
   readonly property bool atRoot: currentPath === "/"
   readonly property var transferStats: Model.transferSummary(transfers)
   readonly property bool needsSetup: cliChecked && !cliInstalled
-  readonly property bool needsLogin: cliInstalled && authChecked && !signedIn
+  readonly property bool needsLogin: cliInstalled && authChecked && !signedIn && !offline
 
   readonly property string homeDir: Quickshell.env("HOME") || ""
   readonly property string downloadDir:
@@ -227,6 +233,19 @@ Item {
       "f=\"${XDG_CONFIG_HOME:-$HOME/.config}/filen-cli/rclone/rclone.conf\"; " +
       "[ -f \"$f\" ] && chmod 600 -- \"$f\""]
     permFixProcess.running = true
+  }
+
+  // An auth-looking failure is ambiguous: confirm we can actually reach the
+  // network before telling the user their session is gone.
+  function classifyAuthFailure(output) {
+    if (Model.isNetworkError(output)) { offline = true; return }
+    pendingAuthFailure = String(output || "").slice(0, 400)
+    if (!reachProcess.running) {
+      // A tiny, dependency-free reachability probe against Filen's own host.
+      reachProcess.command = ["bash", "-c",
+        "exec 3<>/dev/tcp/gateway.filen.io/443 2>/dev/null && exec 3<&- && echo up || echo down"]
+      reachProcess.running = true
+    }
   }
 
   // ── navigation ─────────────────────────────────────────────────────────
@@ -636,7 +655,7 @@ Item {
       root.authChecked = true
       var all = root.combinedOutput(quotaOut.text, quotaErr.text)
       if (exitCode !== 0) {
-        if (Model.isAuthError(all)) { root.signedIn = false; root.quotaLoaded = false; return }
+        if (Model.isAuthError(all)) { root.quotaLoaded = false; root.classifyAuthFailure(all); return }
         if (Model.isConfigRaceError(all) && root.quotaRetries < 3) {
           root.quotaRetries++
           quotaRetryTimer.restart()
@@ -648,6 +667,7 @@ Item {
       }
       root.quotaRetries = 0
       root.signedIn = true
+      root.offline = false
       var s = Model.parseAbout(quotaOut.text)
       if (s) {
         root.usedBytes = s.used
@@ -671,10 +691,9 @@ Item {
       var all = root.combinedOutput(listOut.text, listErr.text)
       if (exitCode !== 0) {
         if (Model.isAuthError(all)) {
-          root.signedIn = false
-          root.authChecked = true
           root.entries = []
           root.listError = ""
+          root.classifyAuthFailure(all)
           return
         }
         // Transient local-config race: retry a couple of times before
@@ -685,6 +704,15 @@ Item {
           return
         }
         root.listRetries = 0
+        // A folder that vanished (deleted elsewhere, or a stale breadcrumb)
+        // must not strand the user in a dead path — walk back up to the
+        // nearest folder that still exists.
+        if (Model.isNotFoundError(all) && targetPath !== "/") {
+          root.showError("That folder no longer exists")
+          root.generation++
+          Qt.callLater(function() { root.list(Model.parentPath(targetPath), true) })
+          return
+        }
         root.listError = Model.errorMessage(exitCode, all)
         root.entries = []
         root.entriesUpdated()
@@ -692,6 +720,7 @@ Item {
       }
       root.signedIn = true
       root.authChecked = true
+      root.offline = false
       var parsed = Model.parseLsJson(listOut.text)
       if (parsed === null) {
         root.listError = "Unexpected response from the Filen CLI"
@@ -724,6 +753,25 @@ Item {
       } else {
         root.showError(Model.errorMessage(exitCode, root.combinedOutput(rmOut.text, rmErr.text)))
       }
+    }
+  }
+
+  // Reachability probe: decides whether an auth-looking failure means
+  // "signed out" or merely "offline".
+  Process {
+    id: reachProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: reachOut; waitForEnd: true }
+    onExited: function() {
+      var up = String(reachOut.text || "").indexOf("up") !== -1
+      root.offline = !up
+      if (up) {
+        // Network is fine, so the credential really is gone.
+        root.signedIn = false
+        root.authChecked = true
+      }
+      root.pendingAuthFailure = ""
     }
   }
 

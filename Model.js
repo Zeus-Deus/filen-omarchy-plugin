@@ -383,10 +383,34 @@ function relativeTime(ms, nowMs) {
 // Map a CLI failure to something a human can act on. `stderr` is CLI-controlled
 // text, so it is sanitized and truncated before it ever reaches a Text element.
 function errorMessage(exitCode, stderr) {
-  var text = sanitizeText(stderr, 200);
   if (isAuthError(stderr)) return "Not signed in to Filen";
+  if (isNotFoundError(stderr)) return "That folder no longer exists";
+  if (isConfigRaceError(stderr)) return "Filen CLI config was busy \u2014 try again";
+  // rclone logs several timestamped lines; show only the most informative one
+  // rather than dumping the whole stream into the panel.
+  var text = sanitizeText(firstMeaningfulLine(stderr), 160);
   if (text === "") return "Filen CLI failed (exit " + exitCode + ")";
   return text;
+}
+
+// Pick the line most worth showing a human out of a multi-line CLI dump, and
+// strip the leading "2026/08/27 23:39:50 ERROR : " decoration.
+function firstMeaningfulLine(text) {
+  var lines = String(text || "").split("\n");
+  var best = "";
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].replace(/^\s+|\s+$/g, "");
+    if (l === "" || l === "[" || l === "]") continue;
+    // drop rclone's timestamp + level prefix
+    l = l.replace(/^\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}\s+/, "");
+    l = l.replace(/^(ERROR|NOTICE|CRITICAL|INFO|DEBUG)\s*:\s*/, "");
+    l = l.replace(/^\s+|\s+$/g, "");
+    if (l === "") continue;
+    if (best === "") best = l;
+    // an explicit "error:"/"failed" line beats a generic first line
+    if (/error|failed|cannot|denied/i.test(l)) return l;
+  }
+  return best;
 }
 
 // The CLI has no `whoami`. When it needs credentials and has no TTY it fails
@@ -400,10 +424,32 @@ function isAuthError(stderr) {
       || s.indexOf("Please ensure that the terminal supports interactive input") !== -1;
 }
 
+// Network failure looks IDENTICAL to being signed out: with no connectivity
+// the CLI cannot validate the stored session, falls back to prompting for
+// credentials, finds no TTY, and prints the same "Failed to read input from
+// terminal" message. Treating that as "signed out" would show a login button
+// every time the Wi-Fi drops — and worse, imply the saved session was lost.
+//
+// So the caller must confirm connectivity before acting on an auth error.
+// These markers identify the network case when the CLI is more forthcoming.
+function isNetworkError(text) {
+  var s = String(text || "");
+  return s.indexOf("dial tcp") !== -1
+      || s.indexOf("no such host") !== -1
+      || s.indexOf("connection refused") !== -1
+      || s.indexOf("network is unreachable") !== -1
+      || s.indexOf("Temporary failure in name resolution") !== -1
+      || s.indexOf("i/o timeout") !== -1
+      || s.indexOf("TLS handshake timeout") !== -1
+      || /error sending request|failed to lookup address/i.test(s);
+}
+
 function isNotFoundError(stderr) {
   var s = String(stderr || "");
   return s.indexOf("No such file or directory") !== -1
-      || s.indexOf("Failed to find item") !== -1;
+      || s.indexOf("Failed to find item") !== -1
+      || s.indexOf("directory not found") !== -1
+      || s.indexOf("object not found") !== -1;
 }
 
 // Every `filen rclone ...` invocation REWRITES ~/.config/filen-cli/rclone/
@@ -579,8 +625,10 @@ if (typeof module !== "undefined" && module.exports) {
     relativeTime: relativeTime,
     errorMessage: errorMessage,
     isAuthError: isAuthError,
+    isNetworkError: isNetworkError,
     isNotFoundError: isNotFoundError,
     isConfigRaceError: isConfigRaceError,
+    firstMeaningfulLine: firstMeaningfulLine,
     oversized: oversized,
     sortEntries: sortEntries,
     sameEntries: sameEntries,

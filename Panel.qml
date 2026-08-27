@@ -59,6 +59,7 @@ Panel {
   readonly property string heroMeta: {
     if (filen.needsSetup) return "Filen CLI not installed"
     if (!filen.cliChecked) return "Looking for the Filen CLI\u2026"
+    if (filen.offline) return "Offline \u2014 can't reach Filen"
     if (filen.needsLogin) return "Not signed in"
     if (filen.listError !== "") return filen.listError
     if (view === "transfers") {
@@ -764,6 +765,48 @@ Panel {
           }
 
           // ── setup: signed out ──────────────────────────────────────────
+          // Offline banner. Distinct from "signed out": the CLI reports both
+          // the same way, so showing a login button here would wrongly imply
+          // the saved session was lost every time the network drops.
+          CursorSurface {
+            visible: filen.offline
+            width: parent.width
+            implicitHeight: offlineInner.implicitHeight + Style.spacing.rowPaddingX * 2
+            foreground: root.foreground
+
+            Column {
+              id: offlineInner
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(12)
+              spacing: Style.space(6)
+
+              Text {
+                width: parent.width
+                text: "Can't reach Filen"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+              Text {
+                width: parent.width
+                text: "You're still signed in \u2014 this looks like a network problem. Your saved session is untouched."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              Button {
+                text: "Try again"
+                iconText: "󰑐"
+                foreground: root.foreground
+                onClicked: filen.refresh()
+              }
+            }
+          }
+
           CursorSurface {
             visible: filen.needsLogin
             width: parent.width
