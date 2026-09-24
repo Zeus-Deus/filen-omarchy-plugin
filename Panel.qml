@@ -548,7 +548,12 @@ Panel {
         if (!root.cursorActive) { root.cursorActive = true; if (dy >= 0 && dx === 0) return }
         root.moveCursor(dx, dy)
       }
-      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      onActivateRequested: {
+        // Before the drive is usable, Enter runs the one thing that unblocks it.
+        if (filen.needsSetup) { root.handOff(filen.runCliInstaller); return }
+        if (filen.needsLogin) { root.handOff(filen.openLoginTerminal); return }
+        if (root.cursorActive) root.activateCursor()
+      }
       onCloseRequested: root.dismiss()
       // `x` is the shell's shared "destructive action" key. In the browser it
       // means delete; in the transfers list it means cancel this transfer.
@@ -760,7 +765,7 @@ Panel {
               }
               Text {
                 width: parent.width
-                text: "This plugin drives the official Filen CLI. Nothing is bundled and nothing is installed for you \u2014 review the instructions and install it yourself, then press Refresh."
+                text: "This plugin drives the official Filen CLI. Install opens a terminal that downloads Filen's own release, checks it against a pinned SHA-256 and puts it in ~/.filen-cli. No admin password needed."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -769,16 +774,22 @@ Panel {
               Row {
                 spacing: Style.space(6)
                 Button {
-                  text: "Installation docs"
+                  text: "Install"
+                  iconText: "󰇚"
+                  foreground: root.foreground
+                  onClicked: root.handOff(filen.runCliInstaller)
+                }
+                Button {
+                  text: "Docs"
                   iconText: "󰖟"
                   foreground: root.foreground
-                  onClicked: filen.openInstallDocs()
+                  onClicked: root.handOff(filen.openInstallDocs)
                 }
                 Button {
                   text: "Recheck"
                   iconText: "󰑐"
                   foreground: root.foreground
-                  onClicked: { filen.cliChecked = false; filen.start() }
+                  onClicked: filen.recheckCli()
                 }
               }
             }
@@ -1317,6 +1328,16 @@ Panel {
               foreground: root.foreground
               onClicked: filen.clearFinishedTransfers()
             }
+          }
+
+          Text {
+            visible: filen.needsSetup || filen.needsLogin
+            width: parent.width
+            text: filen.needsSetup ? "\u21b5 install   \u00b7   esc close" : "\u21b5 sign in   \u00b7   esc close"
+            color: Qt.darker(root.foreground, 2.4)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
 
           // ── keyboard hints ─────────────────────────────────────────────

@@ -16,9 +16,13 @@ from the bar.
 - `Model.js` — pure helpers: parsing, sanitisation, formatting, error
   classification. No Qt imports, Node-testable.
 - `tests/model.test.js` — 88 tests, `node --test tests/model.test.js`.
-- `tests/mock-filen` — fake CLI for states that are hard to reproduce live.
+- `tests/mock-filen` — fake CLI for states that are hard to reproduce live,
+  and the demo drive behind `preview.png` / `docs/images/`.
+- `scripts/install-cli.sh` — pinned, SHA-256-checked CLI installer, run in
+  Omarchy's floating terminal from the panel's Install button. Bump
+  `VERSION` + both digests together when the CLI moves.
 - `scripts/dev-reload.sh` — sync → test → restart shell → check log → IPC.
-- `scripts/security-audit.sh` — 23 static checks.
+- `scripts/security-audit.sh` — 29 static checks.
 - `scripts/security-runtime.sh` — 7 live-process checks.
 
 ## Hard-won facts about the Filen CLI (v0.2.7)

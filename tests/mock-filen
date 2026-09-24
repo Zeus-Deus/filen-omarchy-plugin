@@ -112,6 +112,48 @@ PY
     echo "Uploaded $(basename "$P1")"
     ;;
 
+  # The plugin lists and transfers through the managed rclone passthrough.
+  rclone)
+    sub="${ARGS[1]:-}"
+    case "$sub" in
+      about)
+        echo '{"total":107374182400,"used":34712498176,"free":72661684224}'
+        ;;
+      lsjson)
+        [[ "$MODE" == "empty" ]] && { echo '[]'; exit 0; }
+        [[ "$MODE" == "garbage" ]] && { echo 'not json at all'; exit 0; }
+        path="${ARGS[2]#filen:}"
+        d() { printf '{"Path":"%s","Name":"%s","Size":-1,"MimeType":"inode/directory","ModTime":"%s","IsDir":true}' "$1" "$1" "$2"; }
+        f() { printf '{"Path":"%s","Name":"%s","Size":%s,"MimeType":"%s","ModTime":"%s","IsDir":false}' "$1" "$1" "$2" "$3" "$4"; }
+        case "$path" in
+          /Photos)
+            echo "[$(d 'Iceland 2026' 2026-07-14T09:12:00Z),$(d 'Screenshots' 2026-09-20T18:03:00Z),$(f 'aurora.jpg' 6843210 image/jpeg 2026-07-15T23:41:00Z),$(f 'glacier-walk.mp4' 184320512 video/mp4 2026-07-16T11:02:00Z),$(f 'harbour.heic' 3921044 image/heic 2026-07-14T17:25:00Z),$(f 'lighthouse.png' 2210331 image/png 2026-07-18T20:10:00Z)]"
+            ;;
+          /Documents)
+            echo "[$(d 'Invoices' 2026-09-01T08:00:00Z),$(d 'Taxes 2025' 2026-04-02T10:30:00Z),$(f 'lease-agreement.pdf' 1843022 application/pdf 2026-03-11T14:22:00Z),$(f 'notes.md' 4210 text/markdown 2026-09-23T21:14:00Z),$(f 'budget-2026.xlsx' 88104 application/vnd.openxmlformats-officedocument.spreadsheetml.sheet 2026-09-19T07:45:00Z)]"
+            ;;
+          *)
+            echo "[$(d 'Documents' 2026-09-23T21:14:00Z),$(d 'Photos' 2026-09-20T18:03:00Z),$(d 'Music' 2026-06-02T12:00:00Z),$(d 'Backups' 2026-09-24T03:00:00Z),$(f 'passport-scan.pdf' 2419810 application/pdf 2026-02-08T16:40:00Z),$(f 'project-plan.md' 12044 text/markdown 2026-09-22T10:05:00Z),$(f 'dotfiles.tar.zst' 5230119 application/zstd 2026-09-24T03:00:00Z)]"
+            ;;
+        esac
+        ;;
+      copyto | copy)
+        # Emit rclone-style JSON progress on stderr, then finish.
+        total=48234496
+        steps=8; [[ "$MODE" == "slow" ]] && steps=60
+        for i in $(seq 1 "$steps"); do
+          b=$(( total * i / steps ))
+          printf '{"level":"notice","msg":"stats","stats":{"bytes":%s,"totalBytes":%s,"speed":6291456,"eta":%s}}\n' \
+            "$b" "$total" $(( steps - i )) >&2
+          sleep 1
+        done
+        src="${ARGS[2]:-}"; dst="${ARGS[3]:-}"
+        [[ "$src" == filen:* && -n "$dst" && "$dst" != filen:* ]] && echo "mock content" > "$dst"
+        ;;
+      *) echo "error: unsupported mock rclone verb '$sub'"; exit 2 ;;
+    esac
+    ;;
+
   rm)     echo "Moved to trash" ;;
   mkdir)  echo "Created directory" ;;
 

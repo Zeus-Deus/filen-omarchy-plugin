@@ -8,6 +8,12 @@ transfers — without a browser or memorising CLI flags.
 Built for the Quickshell-based Omarchy 4 shell. Tested against Omarchy
 `4.0.0` and Filen CLI `0.2.7`.
 
+![The file browser in a Photos folder, and the transfers view with three downloads in flight](preview.png)
+
+<sub>Screenshots use a made-up demo drive.</sub>
+
+> Independent community plugin. Not affiliated with or endorsed by Filen.
+
 ## What it does
 
 **Bar widget** — the Filen mark, dimmed when idle, with a count of running
@@ -23,6 +29,8 @@ transfers and a dot when something needs attention.
 - Upload via the desktop file chooser (`u`) or from the clipboard (`p`)
 - Create folders (`n`), delete to Filen trash with confirmation (`x`)
 - Transfers view (`t`) with live percentage, speed, ETA and working cancel
+
+<img src="docs/images/browse.png" alt="The drive root with quota meter, folders and files" width="420">
 
 ### Keys
 
@@ -52,9 +60,26 @@ transfers and a dot when something needs attention.
 omarchy plugin add https://github.com/Zeus-Deus/filen-omarchy-plugin --enable --yes
 ```
 
-The plugin needs the official **Filen CLI** (the Rust rewrite). The plugin
-never downloads or updates it for you. Install the release binary yourself
-and check it against the SHA-256 digest GitHub publishes for the asset
+The plugin needs the official **Filen CLI** (the Rust rewrite). If it is
+missing, the panel says so and offers **Install**:
+
+<img src="docs/images/install.png" alt="The panel when the Filen CLI is missing, with Install, Docs and Recheck" width="420">
+
+**Install** (or `Enter`) opens Omarchy's floating terminal running
+[`scripts/install-cli.sh`](scripts/install-cli.sh). It shows exactly what it
+will fetch and asks before doing anything:
+
+<img src="docs/images/installer.png" alt="The installer terminal showing source, file, pinned SHA-256 and destination" width="620">
+
+It downloads Filen's own release from
+[`filen-cli-releases`](https://github.com/FilenCloudDienste/filen-cli-releases),
+refuses to install unless the SHA-256 matches the value pinned in the script,
+and puts the binary in `~/.filen-cli/bin/filen`. It needs no admin password
+and does not edit your shell config. A newer CLI only arrives with a new
+plugin version. The panel notices the CLI as soon as it lands.
+
+To install it by hand instead, check the binary against the digest GitHub
+publishes for the asset
 (shown on the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases)):
 
 ```bash
@@ -66,8 +91,11 @@ chmod 755 ~/.filen-cli/bin/filen
 ```
 
 The plugin finds `filen` on your `PATH` or in `~/.filen-cli/bin`. Then open
-the panel and press **Sign in with the Filen CLI**. That opens a terminal
-running the CLI's own prompt. Answer `y` to stay signed in, and the CLI keeps
+the panel and press **Sign in with the Filen CLI** (or `Enter`):
+
+<img src="docs/images/signin.png" alt="The signed-out panel with the Sign in with the Filen CLI button" width="420">
+
+That opens a terminal running the CLI's own prompt. Answer `y` to stay signed in, and the CLI keeps
 the session in your system keyring. You can also run `filen stat /` yourself.
 
 The first listing downloads rclone into `~/.config/filen-cli/rclone/`. The
@@ -94,7 +122,7 @@ rm -rf ~/.config/filen-cli ~/.filen-cli
 
 ## Dependencies
 
-- The Filen CLI `0.2.x` (see Install).
+- The Filen CLI `0.2.x` (see Install; the panel can install it for you).
 - Omarchy's own `omarchy-file-select`, `omarchy-launch-terminal` and
   `omarchy-launch-browser`, plus `wl-copy`, `wl-paste`, `xdg-open`,
   `notify-send` and `setsid`. All of these ship with Omarchy.
@@ -170,7 +198,7 @@ networking with Filen happens inside the CLI and its managed rclone.
 Run the audits:
 
 ```bash
-./scripts/security-audit.sh    # 23 static checks over the source
+./scripts/security-audit.sh    # 29 static checks over the source
 ./scripts/security-runtime.sh  # 7 checks against live processes
 ```
 
@@ -207,7 +235,9 @@ omarchy plugin validate .
 
 `tests/mock-filen` is a fake CLI for exercising states that are hard to
 reproduce live (signed out, empty drive, garbage JSON, huge listings, slow
-transfers). Point the plugin at it by putting it earlier in `PATH`.
+transfers). Point the plugin at it by putting it earlier in `PATH`. Its
+`rclone about` / `lsjson` / `copyto` output is the made-up demo drive the
+screenshots use.
 
 Architecture, conventions and traps: see [AGENTS.md](AGENTS.md).
 

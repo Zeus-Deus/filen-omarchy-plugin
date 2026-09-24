@@ -55,6 +55,7 @@ Item {
 
   // ── availability / auth ────────────────────────────────────────────────
   property bool cliChecked: false
+  readonly property string floatingTerminal: "/usr/share/omarchy/bin/omarchy-launch-floating-terminal-with-presentation"
   property bool cliInstalled: false
   property string cliPath: ""
   property string cliVersion: ""
@@ -599,6 +600,21 @@ Item {
     loginWatchTimer.restart()
   }
 
+  // Install the pinned, checksum-verified official CLI in Omarchy's floating
+  // terminal (scripts/install-cli.sh), where the user sees and confirms every
+  // step. The command is a fixed literal: $HOME is expanded by that terminal's
+  // own shell, nothing from the plugin is interpolated into it.
+  function runCliInstaller() {
+    Quickshell.execDetached([floatingTerminal,
+      "bash \"$HOME/.config/omarchy/plugins/io.github.zeus-deus.filen/scripts/install-cli.sh\""])
+    installWatchTimer.restart()
+  }
+
+  function recheckCli() {
+    cliChecked = false
+    start()
+  }
+
   function openInstallDocs() {
     Quickshell.execDetached(["omarchy-launch-browser", "https://docs.filen.io/docs/cli-rs/readme"])
   }
@@ -961,6 +977,21 @@ Item {
 
   // After sending the user to a login terminal, poll briefly so the panel
   // flips to signed-in the moment they finish.
+  // While the installer terminal is open, look for the CLI every few seconds
+  // so the panel moves on to sign-in by itself once it lands.
+  Timer {
+    id: installWatchTimer
+    interval: 3000
+    repeat: true
+    property int ticks: 0
+    onTriggered: {
+      ticks++
+      if (root.cliInstalled || ticks > 100) { stop(); ticks = 0; return }
+      if (!whichProcess.running) root.recheckCli()
+    }
+    onRunningChanged: if (running) ticks = 0
+  }
+
   Timer {
     id: loginWatchTimer
     interval: 3000

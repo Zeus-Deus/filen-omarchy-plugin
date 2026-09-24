@@ -13,6 +13,7 @@ bad(){ printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }
 # comment describing the protection as a violation of it.
 CODE_DIR=$(mktemp -d)
 trap 'rm -rf "$CODE_DIR"' EXIT
+REPO_DIR=$PWD
 python3 - "$PWD" "$CODE_DIR" <<'PY'
 import pathlib, re, sys
 src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
@@ -104,6 +105,18 @@ grep -q 'freeNameScript' Service.qml && ok "downloads never overwrite an existin
 echo
 echo "── credential-cache posture ──"
 grep -q 'configWorldReadable' Service.qml && ok "warns when rclone.conf is group/world readable" || bad "no permission warning"
+
+echo
+echo "── CLI installer ──"
+I="$REPO_DIR/scripts/install-cli.sh"
+grep -q 'FilenCloudDienste/filen-cli-releases/releases/download' "$I" \
+  && ok "installer fetches only Filen's own release" || bad "installer source unexpected"
+grep -cE '^ *SHA256=[0-9a-f]{64}$' "$I" | grep -qx 2 \
+  && ok "installer pins a SHA-256 per architecture" || bad "installer digests not pinned"
+grep -q 'sha256sum -c' "$I" && ok "installer verifies before installing" || bad "installer does not verify"
+grep -qE 'curl[^|]*\| *(ba)?sh' "$I" && bad "installer pipes a download into a shell" || ok "no curl | sh"
+grep -qE '\.(bash|zsh)rc|\.profile' "$I" && bad "installer edits shell config" || ok "installer leaves shell config alone"
+grep -q 'read -r -p' "$I" && ok "installer asks before changing anything" || bad "installer does not confirm"
 
 echo
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
