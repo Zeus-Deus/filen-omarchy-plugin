@@ -11,7 +11,7 @@
   "barWidget": {
     "displayName": "Filen",
     "description": "Filen drive browser with quota, downloads, uploads and quick open.",
-    "category": "Cloud",
+    "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {

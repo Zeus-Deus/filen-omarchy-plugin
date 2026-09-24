@@ -145,12 +145,13 @@ Omarchy shell process**. The design follows from those two facts. The plugin
 is a front end to the official CLI. All encryption, decryption and
 networking with Filen happens inside the CLI and its managed rclone.
 
-- **No network of its own.** No telemetry, analytics or version check. The
-  plugin's only direct connection is a TCP connect-and-close to
-  `gateway.filen.io:443`. It runs only after a failed command, to tell
-  "offline" apart from "signed out", and it sends no data. The `w` key and
-  the install-docs button open `app.filen.io` / `docs.filen.io` in your
-  browser.
+- **No network of its own.** No telemetry, analytics or version check, and
+  nothing is sent anywhere but Filen. The plugin's only direct connection is
+  a TCP connect-and-close to `gateway.filen.io:443`. It runs only after a
+  failed command, to tell "offline" apart from "signed out", and it sends no
+  data. The `w` key and the install-docs button open `app.filen.io` /
+  `docs.filen.io` in your browser. The CLI installer (below) downloads from
+  Filen's GitHub releases, and only when you run it.
 - **Your password never touches the plugin.** There is no password field.
   Sign-in happens in a real terminal running the CLI's own prompt, and the
   CLI stores the session in the system keyring.
@@ -194,6 +195,36 @@ networking with Filen happens inside the CLI and its managed rclone.
   offers to lock `~/.config/filen-cli` to `0700`. That fix persists, even
   though the CLI recreates the file on each sign-in. The plugin only
   `stat`s the file and never reads it.
+
+### What a reviewer will flag
+
+The marketplace's automated baseline reports one capability, **`installer`**,
+and no findings. It comes from `scripts/install-cli.sh`, which exists so a
+missing Filen CLI can be installed from the panel:
+
+- It runs only when you press **Install** (or `Enter`) on the "CLI not
+  installed" panel (`Service.qml:607`). The panel launches Omarchy's
+  `omarchy-launch-floating-terminal-with-presentation` with a fixed command
+  (the script's path in the plugin folder). Nothing from the drive, the
+  settings or the CLI is put into it. Nothing runs when the plugin is
+  installed.
+- The script shows the source, file, pinned SHA-256 and destination, and
+  asks before doing anything. It downloads one file, over HTTPS only, from
+  `github.com/FilenCloudDienste/filen-cli-releases` (Filen's own release
+  repository) for the pinned version 0.2.7 (`install-cli.sh:58`). Then it
+  checks it with `sha256sum -c` against the digest pinned per architecture
+  (`install-cli.sh:62`). Nothing is executed or moved into place before that
+  check passes. On a mismatch, failed download or "n", it stops with
+  "Nothing changed". The digests match the ones GitHub publishes for those
+  release assets.
+- It installs to `~/.filen-cli/bin/filen` only. It needs no admin rights and
+  does not edit shell config, systemd or anything outside that folder. A
+  newer CLI arrives only with a new plugin commit, which gets its own review.
+  The CLI's updater is never run (`--skip-update` on every call).
+
+Everything else the plugin runs is a binary that ships with Omarchy or the
+Filen CLI, each started as a fixed argv. There are no bundled binaries, no
+build step, no service units and no package-manager calls.
 
 Run the audits:
 
@@ -239,7 +270,7 @@ transfers). Point the plugin at it by putting it earlier in `PATH`. Its
 `rclone about` / `lsjson` / `copyto` output is the made-up demo drive the
 screenshots use.
 
-Architecture, conventions and traps: see [AGENTS.md](AGENTS.md).
+Architecture, conventions and traps: see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Licence
 

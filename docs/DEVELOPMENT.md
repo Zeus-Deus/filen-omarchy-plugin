@@ -1,4 +1,4 @@
-# filen-omarchy-plugin
+# Development notes
 
 Omarchy Quattro shell plugin for [Filen](https://filen.io), an end-to-end
 encrypted cloud drive. Browse, download, open, upload and manage transfers
