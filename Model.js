@@ -330,10 +330,29 @@ function iconFor(entry) {
 
 // Only these open in a viewer. Everything else must be downloaded first and
 // handed to xdg-open explicitly by the user.
+//
+// Opening is gated on the extension because a drive can hold files someone
+// else put there (shared folders, received links), and xdg-open hands the
+// file to whatever handler its type maps to. A `.desktop` launcher, a shell
+// script or an HTML page would be *executed* or rendered with scripts rather
+// than viewed — so those are never auto-opened, only revealed in the folder.
+var NEVER_OPEN_EXT = ["desktop", "sh", "bash", "zsh", "fish", "html", "htm",
+                      "xhtml", "js", "mjs", "py", "rb", "pl", "lua", "jar",
+                      "appimage", "run", "bin", "exe", "msi", "bat", "cmd",
+                      "ps1", "vbs", "lnk", "svg"];
+
 function isPreviewable(entry) {
   if (!entry || entry.dir) return false;
+  if (NEVER_OPEN_EXT.indexOf(extensionOf(entry.name)) !== -1) return false;
   var k = entry.kind;
   return k === "image" || k === "video" || k === "audio" || k === "document" || k === "text";
+}
+
+// Same rule for a LOCAL path (a finished download), by its basename.
+function isSafeToOpen(path) {
+  var s = String(path || "");
+  var name = s.slice(s.lastIndexOf("/") + 1);
+  return isPreviewable({ name: name, dir: false, kind: kindOf(name) });
 }
 
 // ---------------------------------------------------------------- formatting
@@ -550,6 +569,11 @@ function safeLocalName(name) {
   s = s.replace(/[\u200B-\u200D\uFEFF]/g, "");
   // C0/C1 controls and DEL -> underscore, so words stay separated
   s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, "_");
+  // rclone's "control picture" stand-ins (U+2400-U+2421: ␀..␟, ␠, ␡). rclone
+  // lists a remote "a\nb" as "a␊b" and DECODES the symbol back to the real
+  // control byte when writing locally — so these must go too, or a newline
+  // lands in the filename on disk after all. Verified against rclone 1.74.
+  s = s.replace(/[\u2400-\u2421]/g, "_");
   // path separators can never appear in a basename
   s = s.replace(/\//g, "_");
   // collapse the runs of underscores that substitution can create
@@ -565,6 +589,41 @@ function safeLocalName(name) {
     s = s.slice(0, 200 - ext.length) + ext;
   }
   return s;
+}
+
+// Split a (sanitized) local name into stem + extension so a collision can be
+// resolved as "report (1).pdf" rather than "report.pdf (1)". Only a short,
+// non-leading extension counts; directories pass isDir and keep no extension.
+function splitExtension(name, isDir) {
+  var s = String(name || "");
+  if (isDir) return { stem: s, ext: "" };
+  var dot = s.lastIndexOf(".");
+  if (dot <= 0 || dot === s.length - 1 || s.length - dot > 12) return { stem: s, ext: "" };
+  return { stem: s.slice(0, dot), ext: s.slice(dot) };
+}
+
+// Is the CLI's key file readable by anyone but its owner?
+// `fileMode` is the octal string from `stat -c %a` for rclone.conf; `dirModes`
+// are the modes of every directory on the way to it that we control
+// (~/.config/filen-cli and its rclone/ subdirectory). A group/other read bit
+// on the file only matters if that same class can also traverse (x) every
+// directory above it — so `chmod 700` on the config dir is a complete fix
+// even though the CLI recreates rclone.conf as 0644 on each sign-in.
+function credentialExposed(fileMode, dirModes) {
+  var f = parseInt(String(fileMode || ""), 8);
+  if (!isFinite(f)) return false;
+  var dirs = dirModes || [];
+  function reachable(shift) {
+    for (var i = 0; i < dirs.length; i++) {
+      var d = parseInt(String(dirs[i] || ""), 8);
+      if (!isFinite(d)) continue;
+      if (((d >> shift) & 1) === 0) return false;   // no x for this class
+    }
+    return true;
+  }
+  var groupRead = ((f >> 5) & 1) === 1;   // 0040
+  var otherRead = ((f >> 2) & 1) === 1;   // 0004
+  return (groupRead && reachable(3)) || (otherRead && reachable(0));
 }
 
 // ---------------------------------------------------------------- transfers
@@ -619,6 +678,7 @@ if (typeof module !== "undefined" && module.exports) {
     kindOf: kindOf,
     iconFor: iconFor,
     isPreviewable: isPreviewable,
+    isSafeToOpen: isSafeToOpen,
     formatSize: formatSize,
     formatPercent: formatPercent,
     formatDate: formatDate,
@@ -636,6 +696,8 @@ if (typeof module !== "undefined" && module.exports) {
     validatedDownloadDir: validatedDownloadDir,
     localTargetName: localTargetName,
     safeLocalName: safeLocalName,
+    splitExtension: splitExtension,
+    credentialExposed: credentialExposed,
     makeTransfer: makeTransfer,
     transferSummary: transferSummary
   };

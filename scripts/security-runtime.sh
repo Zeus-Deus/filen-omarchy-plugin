@@ -72,10 +72,18 @@ echo "── credential file posture ──"
 CONF="$HOME/.config/filen-cli/rclone/rclone.conf"
 if [ -f "$CONF" ]; then
   MODE=$(stat -c %a "$CONF")
-  case "$MODE" in
-    600|400) ok "rclone.conf is $MODE (owner-only)" ;;
-    *)       bad "rclone.conf is $MODE — readable by other local users" ;;
-  esac
+  # The file itself is 0644 by the CLI's choice; what matters is whether
+  # another user can traverse to it. Any directory on the way without o+x
+  # (Omarchy's home is 0700) closes it.
+  REACH=yes
+  for d in "$HOME" "$HOME/.config" "$HOME/.config/filen-cli" "$HOME/.config/filen-cli/rclone"; do
+    [ $(( 0$(stat -c %a "$d") & 01 )) -eq 0 ] && REACH=no
+  done
+  if [ $(( 0$MODE & 044 )) -eq 0 ] || [ "$REACH" = no ]; then
+    ok "rclone.conf ($MODE) is not reachable by other local users"
+  else
+    bad "rclone.conf is $MODE and every directory above it is traversable"
+  fi
 else
   ok "no rclone.conf present"
 fi

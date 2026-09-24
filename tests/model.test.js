@@ -657,3 +657,69 @@ test("isNetworkError does not fire on ordinary failures", () => {
   assert.strictEqual(M.isNetworkError("Failed to read input from terminal"), false);
   assert.strictEqual(M.isNetworkError(""), false);
 });
+
+// ─────────────────────────────────────────────── opening downloaded files
+
+test("isPreviewable never auto-opens launchers, scripts or HTML", () => {
+  // xdg-open would launch a .desktop file and run/render the others.
+  for (const n of ["Invoice.desktop", "setup.sh", "page.html", "x.htm", "tool.py",
+                   "a.js", "App.AppImage", "run.bin", "diagram.svg"]) {
+    assert.strictEqual(M.isPreviewable({ name: n, dir: false, kind: M.kindOf(n) }), false, n);
+  }
+});
+
+test("isPreviewable still opens ordinary media and documents", () => {
+  for (const n of ["photo.png", "clip.mp4", "song.flac", "report.pdf", "notes.md", "data.csv"]) {
+    assert.strictEqual(M.isPreviewable({ name: n, dir: false, kind: M.kindOf(n) }), true, n);
+  }
+  assert.strictEqual(M.isPreviewable({ name: "Pictures", dir: true, kind: "directory" }), false);
+});
+
+test("isSafeToOpen judges a local download path by its basename", () => {
+  assert.strictEqual(M.isSafeToOpen("/home/u/Downloads/photo (1).png"), true);
+  assert.strictEqual(M.isSafeToOpen("/home/u/Downloads/Invoice.desktop"), false);
+  assert.strictEqual(M.isSafeToOpen("/home/u/Downloads/archive.tar.gz"), false);
+  assert.strictEqual(M.isSafeToOpen(""), false);
+});
+
+// ─────────────────────────────────────────────── download collisions
+
+test("splitExtension keeps the extension for collision suffixes", () => {
+  assert.deepStrictEqual(M.splitExtension("report.pdf", false), { stem: "report", ext: ".pdf" });
+  assert.deepStrictEqual(M.splitExtension("archive.tar.gz", false), { stem: "archive.tar", ext: ".gz" });
+  assert.deepStrictEqual(M.splitExtension("README", false), { stem: "README", ext: "" });
+  assert.deepStrictEqual(M.splitExtension("v1.2 photos", true), { stem: "v1.2 photos", ext: "" });
+  assert.deepStrictEqual(M.splitExtension("x.averyveryverylongext", false),
+                         { stem: "x.averyveryverylongext", ext: "" });
+});
+
+// ─────────────────────────────────────────────── credential file exposure
+
+test("credentialExposed: 0644 key file behind a 0700 home is not exposed", () => {
+  // Omarchy's default: HOME_MODE 0700, so the CLI's 0644 file is unreachable.
+  assert.strictEqual(M.credentialExposed("644", ["700", "755", "755", "755"]), false);
+});
+
+test("credentialExposed: 0644 key file with every directory traversable is exposed", () => {
+  assert.strictEqual(M.credentialExposed("644", ["755", "755", "755", "755"]), true);
+  assert.strictEqual(M.credentialExposed("640", ["750", "750", "750", "750"]), true);
+});
+
+test("credentialExposed: the plugin's fix (config dir 0700) closes it", () => {
+  assert.strictEqual(M.credentialExposed("644", ["755", "755", "700", "755"]), false);
+  assert.strictEqual(M.credentialExposed("600", ["755", "755", "755", "755"]), false);
+});
+
+test("credentialExposed tolerates garbage", () => {
+  assert.strictEqual(M.credentialExposed("", []), false);
+  assert.strictEqual(M.credentialExposed("zz", ["755"]), false);
+  assert.strictEqual(M.credentialExposed("644", ["zz"]), true);
+});
+
+test("safeLocalName strips rclone control-picture stand-ins", () => {
+  // rclone lists "line\nbreak.txt" as "line\u240Abreak.txt" and decodes the
+  // symbol back into a real newline when it writes the local file.
+  assert.strictEqual(M.safeLocalName("line\u240Abreak.txt"), "line_break.txt");
+  assert.strictEqual(M.safeLocalName("a\u2400b\u241Bc\u2421.txt"), "a_b_c_.txt");
+  assert.strictEqual(M.safeLocalName("\u2420lead.txt"), "lead.txt");
+});

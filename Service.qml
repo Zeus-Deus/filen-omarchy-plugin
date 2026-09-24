@@ -41,8 +41,9 @@ import "Model.js" as Model
 //   Classify on both streams or a signed-out account reads as signed in.
 // * `--` is accepted by ls/stat/mkdir/rm but NOT by the rclone passthrough.
 // * The CLI writes ~/.config/filen-cli/rclone/rclone.conf containing the
-//   master keys, private key and API key — and creates it mode 0644
-//   (world-readable). We detect that and warn; we never read the contents.
+//   master keys, private key and API key — and creates it mode 0644. Behind
+//   a 0700 home that is unreachable; we warn only when another user could
+//   actually traverse to it, and never read the contents.
 Item {
   id: root
 
@@ -68,7 +69,6 @@ Item {
 
   // Security posture of the CLI's own credential cache.
   property bool configWorldReadable: false
-  property string configPath: ""
 
   // ── drive ──────────────────────────────────────────────────────────────
   property double usedBytes: 0
@@ -121,6 +121,9 @@ Item {
   signal transfersUpdated()
   signal navigated(string path)
   signal transferFinished(string kind, string label, bool ok)
+  // Emitted just before a viewer window is launched, so the panel can get out
+  // of the way and hand keyboard focus to it.
+  signal launching()
 
   function setting(name, fallback) {
     var v = settings ? settings[name] : undefined
@@ -218,20 +221,33 @@ Item {
   }
 
   // Warn if the CLI's credential cache is readable by other local users.
-  // We only stat() it — the contents are never read.
+  // We only stat() it — the contents are never read. Prints the file's mode
+  // on the first line, then the mode of every directory another user would
+  // have to traverse to reach it ($HOME only when the config lives under it).
+  // The file being 0644 is harmless behind a 0700 home, which is Omarchy's
+  // default — warning there would be a false alarm.
+  readonly property string permCheckScript:
+    "c=\"${XDG_CONFIG_HOME:-$HOME/.config}\"; f=\"$c/filen-cli/rclone/rclone.conf\"; " +
+    "[ -f \"$f\" ] || exit 0; stat -c %a -- \"$f\"; " +
+    "case \"$c\" in \"$HOME\"/*) stat -c %a -- \"$HOME\";; esac; " +
+    "for d in \"$c\" \"$c/filen-cli\" \"$c/filen-cli/rclone\"; do stat -c %a -- \"$d\"; done"
+
+  // Lock the whole CLI config directory (keys, logs that name the account)
+  // to the user, and the key file itself to 0600. The directory mode is what
+  // makes this durable: the CLI recreates rclone.conf 0644 on each sign-in.
+  readonly property string permFixScript:
+    "c=\"${XDG_CONFIG_HOME:-$HOME/.config}/filen-cli\"; [ -d \"$c\" ] || exit 1; " +
+    "chmod 700 -- \"$c\" && { [ ! -f \"$c/rclone/rclone.conf\" ] || chmod 600 -- \"$c/rclone/rclone.conf\"; }"
+
   function checkConfigPermissions() {
     if (permProcess.running) return
-    permProcess.command = ["bash", "-c",
-      "f=\"${XDG_CONFIG_HOME:-$HOME/.config}/filen-cli/rclone/rclone.conf\"; " +
-      "if [ -f \"$f\" ]; then printf '%s %s' \"$(stat -c %a -- \"$f\")\" \"$f\"; fi"]
+    permProcess.command = ["bash", "-c", root.permCheckScript]
     permProcess.running = true
   }
 
   function hardenConfigPermissions() {
     if (permFixProcess.running) return
-    permFixProcess.command = ["bash", "-c",
-      "f=\"${XDG_CONFIG_HOME:-$HOME/.config}/filen-cli/rclone/rclone.conf\"; " +
-      "[ -f \"$f\" ] && chmod 600 -- \"$f\""]
+    permFixProcess.command = ["bash", "-c", root.permFixScript]
     permFixProcess.running = true
   }
 
@@ -310,22 +326,60 @@ Item {
     if (localName === null) { showError("Unsupported name"); return }
 
     var id = "t" + (++transferSeq)
-    var local = downloadDir + "/" + localName
-    var t = Model.makeTransfer(id, "download", entry.display, remote, local)
+    var t = Model.makeTransfer(id, "download", entry.display, remote, "")
     t.openWhenDone = thenOpen === true
     t.kindHint = entry.kind
     t.isDir = entry.dir === true
     pushTransfer(t)
 
-    if (entry.dir) {
-      // `copy` places the source's CONTENTS into dest, so name the dest after
-      // the (sanitized) folder to reproduce the remote structure.
-      startTransfer(id, rcloneTransferArgs(["copy", remoteUrl(remote), local]))
-    } else {
-      // `copyto` writes exactly one destination path, which is what lets us
-      // choose the sanitized local filename instead of inheriting the remote.
-      startTransfer(id, rcloneTransferArgs(["copyto", remoteUrl(remote), local]))
+    // Never overwrite: `rclone copyto` silently replaces an existing local
+    // file, so a second "report.pdf" would destroy the first. Pick a free
+    // name ("report (1).pdf") before starting, also avoiding names already
+    // claimed by downloads still in flight.
+    var parts = Model.splitExtension(localName, t.isDir)
+    var argv = ["bash", "-c", root.freeNameScript, "filen-free-name",
+                downloadDir, parts.stem, parts.ext].concat(pendingLocalPaths())
+    var proc = resolveComponent.createObject(root, { transferId: id, argv: argv })
+    if (!proc) { finishTransfer(id, 1, "Could not start transfer"); return }
+    proc.running = true
+  }
+
+  // Prints "$dir/$stem$ext", or the first "$dir/$stem (N)$ext" that neither
+  // exists on disk nor appears in the reserved list ($4...). Values arrive as
+  // positional parameters; the body is a fixed literal.
+  readonly property string freeNameScript:
+    "d=$1 s=$2 e=$3; shift 3; " +
+    "taken(){ { [ -e \"$1\" ] || [ -L \"$1\" ]; } && return 0; " +
+    "for r in \"${R[@]}\"; do [ \"$r\" = \"$1\" ] && return 0; done; return 1; }; " +
+    "R=(\"$@\"); p=\"$d/$s$e\"; n=1; " +
+    "while taken \"$p\"; do [ $n -gt 999 ] && exit 1; p=\"$d/$s ($n)$e\"; n=$((n+1)); done; " +
+    "printf '%s' \"$p\""
+
+  function pendingLocalPaths() {
+    var out = []
+    for (var i = 0; i < transfers.length; i++) {
+      var t = transfers[i]
+      if (t.kind === "download" && t.state === "running" && t.localPath) out.push(t.localPath)
     }
+    return out
+  }
+
+  function beginDownload(id, local) {
+    var t = null
+    for (var i = 0; i < transfers.length; i++) if (transfers[i].id === id) t = transfers[i]
+    if (!t || t.state !== "running") return
+    // The resolved path must be a direct child of the download directory.
+    var prefix = downloadDir === "/" ? "/" : downloadDir + "/"
+    var rest = local.indexOf(prefix) === 0 ? local.slice(prefix.length) : ""
+    if (rest === "" || rest.indexOf("/") !== -1 || /[\u0000-\u001F]/.test(rest)) {
+      finishTransfer(id, 1, "Could not choose a download name")
+      return
+    }
+    updateTransfer(id, { localPath: local })
+    // `copy` places a folder's CONTENTS into dest, so dest is named after the
+    // (sanitized) folder; `copyto` writes exactly the one path we chose.
+    startTransfer(id, rcloneTransferArgs([t.isDir ? "copy" : "copyto",
+                                          remoteUrl(t.remotePath), local]))
   }
 
   function upload(localPath) {
@@ -342,13 +396,14 @@ Item {
     startTransfer(id, rcloneTransferArgs(["copyto", p, remoteUrl(destRemote)]))
   }
 
-  // Open the desktop file chooser and upload whatever comes back. zenity is
-  // the GTK portal's own dialog, so it matches the rest of the desktop and
-  // needs no bespoke UI. Multiple selections are separated by newlines.
+  // Open the desktop file chooser and upload whatever comes back.
+  // `omarchy-file-select` is Omarchy's own xdg-desktop-portal FileChooser
+  // client (ships with the shell), so it matches the desktop and needs no
+  // extra dependency. It prints one local path per line; exit 1 = nothing
+  // picked, exit 2 = the chooser itself failed.
   function pickAndUpload() {
     if (!signedIn || pickProcess.running) return
-    pickProcess.command = ["zenity", "--file-selection", "--multiple",
-                           "--separator=\n", "--title=Upload to Filen"]
+    pickProcess.command = ["omarchy-file-select", "--title", "Upload to Filen", "--multiple"]
     pickProcess.running = true
   }
 
@@ -518,10 +573,14 @@ Item {
   // Hand a LOCAL file to the user's configured handler. xdg-open respects the
   // Omarchy defaults (imv for images, mpv for video, evince for PDF), so the
   // plugin never hardcodes a viewer. The path is argv[1] of a fixed command —
-  // no shell, no interpolation.
+  // no shell, no interpolation. Anything that is not a plain viewable type
+  // (a .desktop launcher, a script, HTML) is revealed in its folder instead
+  // of opened: xdg-open would launch or execute it. See Model.isSafeToOpen.
   function openLocal(path) {
     var p = String(path || "")
     if (p === "" || p.charAt(0) !== "/") return
+    launching()
+    if (!Model.isSafeToOpen(p)) { revealLocal(p); return }
     Quickshell.execDetached(["xdg-open", p])
   }
 
@@ -551,8 +610,8 @@ Item {
   function copyText(text) {
     var s = String(text || "")
     if (s === "") return
-    // Text as a positional arg, never interpolated into the script body.
-    Quickshell.execDetached(["bash", "-c", "printf %s \"$1\" | wl-copy", "wl-copy", s])
+    // wl-copy takes the text as argv; `--` keeps a leading dash literal.
+    Quickshell.execDetached(["wl-copy", "--", s])
   }
 
   // ── mutations ──────────────────────────────────────────────────────────
@@ -618,14 +677,11 @@ Item {
     command: []
     stdout: StdioCollector { id: permOut; waitForEnd: true }
     onExited: function() {
-      var parts = String(permOut.text || "").trim().split(" ")
-      if (parts.length < 2) { root.configWorldReadable = false; return }
-      var mode = parts[0]
-      root.configPath = parts.slice(1).join(" ")
-      // Any group/other read bit on a file holding master keys is a problem.
-      var g = parseInt(mode.charAt(mode.length - 2), 10)
-      var o = parseInt(mode.charAt(mode.length - 1), 10)
-      root.configWorldReadable = (isFinite(g) && g !== 0) || (isFinite(o) && o !== 0)
+      var modes = String(permOut.text || "").trim().split("\n")
+      if (modes.length < 2 || modes[0] === "") { root.configWorldReadable = false; return }
+      // Only a problem when another user can both read the file AND traverse
+      // every directory above it.
+      root.configWorldReadable = Model.credentialExposed(modes[0], modes.slice(1))
     }
   }
 
@@ -782,8 +838,9 @@ Item {
     command: []
     stdout: StdioCollector { id: pickOut; waitForEnd: true }
     onExited: function(exitCode) {
-      // exit 1 = the user cancelled the dialog; that is not an error.
-      if (exitCode !== 0) return
+      // exit 1 = the user picked nothing; that is not an error.
+      if (exitCode === 1) return
+      if (exitCode !== 0) { root.showError("File chooser unavailable"); return }
       root.uploadPathList(pickOut.text)
     }
   }
@@ -812,6 +869,24 @@ Item {
         root.list(root.currentPath, true)
       } else {
         root.showError(Model.errorMessage(exitCode, root.combinedOutput(mkdirOut.text, mkdirErr.text)))
+      }
+    }
+  }
+
+  // Resolves a non-clobbering local download path (see freeNameScript).
+  Component {
+    id: resolveComponent
+    Process {
+      id: resolver
+      property string transferId: ""
+      property var argv: []
+      running: false
+      command: argv
+      stdout: StdioCollector { id: resolveOut; waitForEnd: true }
+      onExited: function(exitCode) {
+        if (exitCode === 0) root.beginDownload(transferId, String(resolveOut.text || ""))
+        else root.finishTransfer(transferId, 1, "Could not choose a download name")
+        destroy()
       }
     }
   }

@@ -162,6 +162,7 @@ Worth considering alongside it:
 3. A unit test mirroring `write_private_file_creates_owner_only` / `write_private_file_tightens_existing_lax_file`.
 4. On Windows no Unix mode applies and the file inherits profile ACLs; a comment noting that would avoid confusion, no code needed.
 5. Longer term: avoid materialising `master_keys` / `private_key` on disk at all if rclone can be fed the config over stdin or a `--config /dev/fd/N` handle.
+6. `filen logout` should delete `rclone.conf`. Today it clears the keyring entries but leaves this file. Tested on 0.2.7: after `logout`, `rclone.conf` is still on disk with `master_keys`, `api_key` and `private_key`, and the managed rclone (`rclone-v1.74.2-linux-amd64 --config <config_dir>/rclone/rclone.conf lsf filen:/`) still lists the drive. Signing out therefore does not revoke local access; users have to delete the file by hand.
 
 ### Workaround for users
 

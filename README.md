@@ -48,28 +48,56 @@ transfers and a dot when something needs attention.
 
 ## Install
 
-Requires the Filen CLI. Install it yourself — the plugin never downloads or
-updates anything on your behalf:
-
 ```bash
-# review first: https://github.com/FilenCloudDienste/filen-cli-releases
-curl -sL https://raw.githubusercontent.com/FilenCloudDienste/filen-rs/refs/heads/main/filen-cli/install.sh -o /tmp/filen-install.sh
-less /tmp/filen-install.sh
-bash /tmp/filen-install.sh
+omarchy plugin add https://github.com/Zeus-Deus/filen-omarchy-plugin --enable --yes
 ```
 
-Sign in once, in a terminal. The CLI stores the session in your system
-keyring; the plugin never sees your password:
+The plugin needs the official **Filen CLI** (the Rust rewrite). The plugin
+never downloads or updates it for you. Install the release binary yourself
+and check it against the SHA-256 digest GitHub publishes for the asset
+(shown on the [release page](https://github.com/FilenCloudDienste/filen-cli-releases/releases)):
 
 ```bash
-filen stat /      # prompts for email/password, answer "y" to stay signed in
+mkdir -p ~/.filen-cli/bin
+curl -fL -o ~/.filen-cli/bin/filen \
+  https://github.com/FilenCloudDienste/filen-cli-releases/releases/download/0.2.7/filen-cli-0.2.7-x86_64-unknown-linux-gnu
+echo "d05c3a4a7585cbbfe936da7a479738982928df49576bd2374c8b608b4d889189  $HOME/.filen-cli/bin/filen" | sha256sum -c
+chmod 755 ~/.filen-cli/bin/filen
 ```
 
-Then add the plugin:
+The plugin finds `filen` on your `PATH` or in `~/.filen-cli/bin`. Then open
+the panel and press **Sign in with the Filen CLI**. That opens a terminal
+running the CLI's own prompt. Answer `y` to stay signed in, and the CLI keeps
+the session in your system keyring. You can also run `filen stat /` yourself.
+
+The first listing downloads rclone into `~/.config/filen-cli/rclone/`. The
+CLI's managed rclone is checksum-pinned in the CLI's source.
+
+## Remove
 
 ```bash
-omarchy plugin add https://github.com/<you>/filen-omarchy-plugin --enable --yes
+omarchy plugin remove io.github.zeus-deus.filen
 ```
+
+Removal deletes the plugin folder and its bar entry. The plugin keeps no
+data of its own. Downloaded files stay where you saved them. Your Filen
+session and the CLI stay installed too, because they belong to the CLI and
+not to the plugin. To sign out and delete the CLI's saved keys, run this
+before removing it. The `rm` is not optional. In CLI 0.2.7, `filen logout`
+clears the keyring but leaves `~/.config/filen-cli/rclone/rclone.conf` behind,
+and that file still has working keys for the whole drive:
+
+```bash
+filen logout
+rm -rf ~/.config/filen-cli ~/.filen-cli
+```
+
+## Dependencies
+
+- The Filen CLI `0.2.x` (see Install).
+- Omarchy's own `omarchy-file-select`, `omarchy-launch-terminal` and
+  `omarchy-launch-browser`, plus `wl-copy`, `wl-paste`, `xdg-open`,
+  `notify-send` and `setsid`. All of these ship with Omarchy.
 
 ## Settings
 
@@ -85,11 +113,19 @@ Configurable in `Setup > Plugins`, stored inline in `~/.config/omarchy/shell.jso
 ## Security
 
 Filen is zero-knowledge, and this plugin runs **unsandboxed inside the
-Omarchy shell process**. The design follows from those two facts.
+Omarchy shell process**. The design follows from those two facts. The plugin
+is a front end to the official CLI. All encryption, decryption and
+networking with Filen happens inside the CLI and its managed rclone.
 
+- **No network of its own.** No telemetry, analytics or version check. The
+  plugin's only direct connection is a TCP connect-and-close to
+  `gateway.filen.io:443`. It runs only after a failed command, to tell
+  "offline" apart from "signed out", and it sends no data. The `w` key and
+  the install-docs button open `app.filen.io` / `docs.filen.io` in your
+  browser.
 - **Your password never touches the plugin.** There is no password field.
-  Sign-in happens in a real terminal running the CLI's own prompt; the CLI
-  stores the session in the system keyring.
+  Sign-in happens in a real terminal running the CLI's own prompt, and the
+  CLI stores the session in the system keyring.
 - **No secrets in argv.** `/proc/<pid>/cmdline` is world-readable. Verified
   at runtime during a live transfer: the command lines contain only paths
   and flags.
@@ -106,25 +142,35 @@ Omarchy shell process**. The design follows from those two facts.
   can be anything. Responses are size-capped, JSON is parsed defensively, and
   displayed text is stripped of control characters and bidi overrides, then
   rendered as `PlainText`.
-- **Downloads are written under a sanitized name.** The remote path stays
-  byte-exact so the right object is fetched, but the local filename has bidi
-  and control characters removed. Without this, a drive file called
-  `ev<U+202E>gnp.exe` lands on your disk displaying as `evexe.gnp` — a real
-  bug this plugin had, found by testing against a hostile fixture.
+- **Downloads are written under a sanitized name and never overwrite.**
+  The remote path stays byte-exact so the right object is fetched. The local
+  filename has bidi and control characters removed. Without this, a drive
+  file called `ev<U+202E>gnp.exe` would land on your disk displaying as
+  `evexe.gnp`. If the name is already taken, the download is saved as
+  `name (1).ext` and your existing file is left alone.
+- **Only viewable types are auto-opened.** `Enter`/`o` hands images, video,
+  audio, PDFs and plain text to `xdg-open`. Launchers (`.desktop`), scripts,
+  HTML, SVG and executables are downloaded and then shown in their folder,
+  never opened. A shared folder can contain anything, and `xdg-open` would
+  run those files.
 - **The updater never fires on its own.** Every call passes `--skip-update`;
   updating the CLI is your decision.
 - **Deletes go to the Filen trash** and are confirmation-gated by default.
   The plugin can never empty the trash or permanently delete.
-- **It warns about the CLI's own credential cache.** The Filen CLI writes
-  `~/.config/filen-cli/rclone/rclone.conf` — containing `master_keys`,
-  `api_key` and `private_key` in plaintext — as mode **0644**, readable by
-  every local user. The panel detects this and offers to `chmod 600` it.
-  *(Worth reporting upstream.)*
+- **It checks the CLI's own key file.** The Filen CLI writes
+  `~/.config/filen-cli/rclone/rclone.conf` with `master_keys`, `api_key`
+  and `private_key` in plaintext, as mode **0644**
+  ([reported upstream](https://github.com/FilenCloudDienste/filen-rs/issues/16)).
+  Omarchy's `0700` home directory already keeps other users out, so the
+  panel warns only when another user could actually reach the file. It
+  offers to lock `~/.config/filen-cli` to `0700`. That fix persists, even
+  though the CLI recreates the file on each sign-in. The plugin only
+  `stat`s the file and never reads it.
 
 Run the audits:
 
 ```bash
-./scripts/security-audit.sh    # 21 static checks over the source
+./scripts/security-audit.sh    # 23 static checks over the source
 ./scripts/security-runtime.sh  # 7 checks against live processes
 ```
 
@@ -154,7 +200,7 @@ this:
 ## Development
 
 ```bash
-node --test tests/model.test.js   # 79 unit tests, no Qt needed
+node --test tests/model.test.js   # 88 unit tests, no Qt needed
 omarchy plugin validate .
 ./scripts/dev-reload.sh           # sync, test, restart shell, check for errors
 ```

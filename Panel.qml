@@ -107,6 +107,7 @@ Panel {
   function bodySection() { return view === "transfers" ? "transfers" : "entries" }
 
   function moveCursor(dx, dy) {
+    pointerGate.reset()
     cursorActive = true
     ensureCursor()
 
@@ -147,7 +148,7 @@ Panel {
     if (focusSection === "header") { filen.refresh(); return }
     if (view === "transfers") {
       var t = selectedTransfer()
-      if (t && t.state === "done" && t.kind === "download") filen.openLocal(t.localPath)
+      if (t && t.state === "done" && t.kind === "download") root.handOff(function() { filen.openLocal(t.localPath) })
       return
     }
     var e = selectedEntry()
@@ -208,6 +209,15 @@ Panel {
     pendingDelete = e
     confirm.selectedIndex = 0     // default to Cancel — x then Enter must not delete
     Qt.callLater(function() { confirmKeys.forceActiveFocus() })
+  }
+
+  // Launching another window (file chooser, sign-in terminal, browser) from
+  // a keyboard-grabbing layer panel would leave the panel on top holding
+  // focus, so keys meant for the new window land in the panel. Close first,
+  // as the built-in panels do, then launch.
+  function handOff(action) {
+    close()
+    action()
   }
 
   function closeConfirm() {
@@ -311,6 +321,7 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      pointerGate.reset()
       cursorActive = false
       focusSection = "header"
       if (panelFlick) panelFlick.contentY = 0
@@ -323,11 +334,18 @@ Panel {
     }
   }
 
+  PointerMoveGate {
+    id: pointerGate
+    referenceItem: keyCatcher
+  }
+
   Service {
     id: filen
     settings: root.settings
     panelOpen: root.opened
+    onLaunching: root.close()
     onEntriesUpdated: {
+      pointerGate.reset()
       // Restore the cursor: prefer the folder we just stepped out of, else
       // whatever row we were on last time we were in this folder.
       if (root.pendingReturnName !== "") {
@@ -410,6 +428,7 @@ Panel {
     function select(index: string): string {
       var i = parseInt(index, 10)
       if (!isFinite(i) || i < 0 || i >= root.visibleEntries.length) return "out-of-range"
+      pointerGate.reset()
       root.setRowCursor("entries", i)
       return root.visibleEntries[i].display
     }
@@ -452,6 +471,7 @@ Panel {
         totalBytes: filen.totalBytes,
         transfers: filen.transferStats,
         listError: filen.listError,
+        credentialExposed: filen.configWorldReadable,
         view: root.view
       })
     }
@@ -554,8 +574,8 @@ Panel {
         else if (k === "o") root.downloadSelected(true)
         else if (k === "n") root.startNewFolder()
         else if (k === "t") root.toggleView()
-        else if (k === "w") filen.openWebDrive()
-        else if (k === "u") filen.pickAndUpload()
+        else if (k === "w") root.handOff(filen.openWebDrive)
+        else if (k === "u") root.handOff(filen.pickAndUpload)
         else if (k === "p") filen.uploadFromClipboard()
         else if (k === "c" && root.view === "transfers") filen.clearFinishedTransfers()
         else if (k === "y") {
@@ -615,7 +635,7 @@ Panel {
                     foreground: hero.foreground
                     fontFamily: hero.fontFamily
                     hasCursor: false
-                    onClicked: filen.pickAndUpload()
+                    onClicked: root.handOff(filen.pickAndUpload)
                   }
 
                   PanelActionButton {
@@ -692,7 +712,7 @@ Panel {
                   font.pixelSize: Style.font.icon
                 }
                 Text {
-                  text: "Credential file is readable by other users"
+                  text: "Your Filen keys are readable by other users"
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -700,7 +720,7 @@ Panel {
               }
               Text {
                 width: parent.width
-                text: "The Filen CLI stored your master keys and API key in a world-readable file. Anyone with an account on this machine could decrypt your drive."
+                text: "The Filen CLI saved your decryption keys in a file other accounts on this machine can open. Locking its folder keeps them yours."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -841,7 +861,7 @@ Panel {
                 text: "Sign in with the Filen CLI"
                 iconText: "󰌾"
                 foreground: root.foreground
-                onClicked: filen.openLoginTerminal()
+                onClicked: root.handOff(filen.openLoginTerminal)
               }
             }
           }
@@ -1045,7 +1065,12 @@ Panel {
                     hoverEnabled: true
                     acceptedButtons: Qt.LeftButton | Qt.RightButton
                     cursorShape: Qt.PointingHandCursor
-                    onEntered: root.setRowCursor("entries", index)
+                    // Only real pointer movement moves the cursor: a pointer
+                    // parked over the list must not steal the row the keyboard
+                    // chose when rows repaint under it (shell PointerMoveGate).
+                    onPositionChanged: function(mouse) {
+                      if (pointerGate.moved(entryRow, mouse)) root.setRowCursor("entries", index)
+                    }
                     onClicked: function(mouse) {
                       root.setRowCursor("entries", index)
                       if (mouse.button === Qt.RightButton) { root.requestDeleteSelected(); return }
@@ -1177,11 +1202,13 @@ Panel {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onEntered: root.setRowCursor("transfers", index)
+                    onPositionChanged: function(mouse) {
+                      if (pointerGate.moved(transferRow, mouse)) root.setRowCursor("transfers", index)
+                    }
                     onClicked: {
                       root.setRowCursor("transfers", index)
                       if (modelData.state === "done" && modelData.kind === "download")
-                        filen.openLocal(modelData.localPath)
+                        root.handOff(function() { filen.openLocal(modelData.localPath) })
                     }
                   }
 

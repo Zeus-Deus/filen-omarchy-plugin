@@ -15,10 +15,10 @@ from the bar.
 - `FilenIcon.qml` — the mark drawn natively on a `Canvas` (no bundled image).
 - `Model.js` — pure helpers: parsing, sanitisation, formatting, error
   classification. No Qt imports, Node-testable.
-- `tests/model.test.js` — 79 tests, `node --test tests/model.test.js`.
+- `tests/model.test.js` — 88 tests, `node --test tests/model.test.js`.
 - `tests/mock-filen` — fake CLI for states that are hard to reproduce live.
 - `scripts/dev-reload.sh` — sync → test → restart shell → check log → IPC.
-- `scripts/security-audit.sh` — 21 static checks.
+- `scripts/security-audit.sh` — 23 static checks.
 - `scripts/security-runtime.sh` — 7 live-process checks.
 
 ## Hard-won facts about the Filen CLI (v0.2.7)
@@ -52,8 +52,11 @@ Re-verify if the CLI version moves.
     launched under `setsid` so cancel can signal the whole group
     (`kill -TERM -- -PID`, then `-KILL` after 3s).
 11. **rclone.conf is created 0644** and contains `master_keys`, `api_key`,
-    `private_key` in plaintext. `chmod 600` survives subsequent runs. The
-    panel warns and offers to fix it.
+    `private_key` in plaintext (upstream: filen-rs#16). Omarchy homes are
+    0700, so it is only exposed when every directory above it is
+    traversable; `Model.credentialExposed` checks exactly that. The fix
+    locks `~/.config/filen-cli` to 0700, which survives the CLI recreating
+    the file on sign-in.
 12. `--quiet` suppresses the failure text we classify on. Don't pass it.
 13. Progress: `--use-json-log --stats 1s --stats-log-level NOTICE` emits one
     JSON object per line on stderr with a `stats` block. Read it with
@@ -79,6 +82,11 @@ These are enforced by `scripts/security-audit.sh`; keep them true.
 - Every call carries `--skip-update`.
 - Deletes go to the Filen trash and are confirmation-gated. Never
   `--permanent`, never `empty-trash`.
+- Downloads never overwrite: a free local name is resolved first
+  (`freeNameScript`). `xdg-open` is only used for `Model.isSafeToOpen`
+  types; launchers/scripts/HTML are revealed, never opened.
+- No literal elevation-command names anywhere in tracked source — the
+  marketplace security baseline greps for them, even in this audit script.
 
 ## Plugin conventions (from the shell + installed 3p plugins)
 
