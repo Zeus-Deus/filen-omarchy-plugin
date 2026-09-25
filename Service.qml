@@ -177,6 +177,15 @@ Item {
     return "filen:" + (p === "/" ? "" : p)
   }
 
+  // Every Process whose output lands in a StdioCollector runs through the
+  // bounded wrapper (Model.boundedArgv): the collector buffers the whole
+  // stream until exit, so the ceiling has to be enforced while the child is
+  // still writing, not after. Only fixed local scripts with a few bytes of
+  // output (which, stat, reachability) are exempt.
+  function bounded(argv, outCap) {
+    return Model.boundedArgv(argv, outCap, Model.MAX_STDERR_BYTES)
+  }
+
   function showStatus(text) {
     actionError = ""
     actionStatus = text
@@ -217,7 +226,8 @@ Item {
   function refreshQuota() {
     if (!cliInstalled || quotaProcess.running) return
     quotaProcess.generation = generation
-    quotaProcess.command = rcloneArgs(["about", "filen:", "--json"])
+    quotaProcess.command = bounded(rcloneArgs(["about", "filen:", "--json"]),
+                                   Model.MAX_SMALL_RESPONSE_BYTES)
     quotaProcess.running = true
   }
 
@@ -276,8 +286,11 @@ Item {
     listError = ""
     listProcess.generation = generation
     listProcess.targetPath = target
-    // lsjson gives name + size + mtime + IsDir + MimeType in ONE call.
-    listProcess.command = rcloneArgs(["lsjson", remoteUrl(target)])
+    // lsjson gives name + size + mtime + IsDir + MimeType in ONE call. A
+    // shared folder can hold any number of entries, so the listing is cut
+    // off at MAX_RESPONSE_BYTES while it streams, never collected whole.
+    listProcess.command = bounded(rcloneArgs(["lsjson", remoteUrl(target)]),
+                                  Model.MAX_RESPONSE_BYTES)
     listProcess.running = true
   }
 
@@ -404,7 +417,8 @@ Item {
   // picked, exit 2 = the chooser itself failed.
   function pickAndUpload() {
     if (!signedIn || pickProcess.running) return
-    pickProcess.command = ["omarchy-file-select", "--title", "Upload to Filen", "--multiple"]
+    pickProcess.command = bounded(["omarchy-file-select", "--title", "Upload to Filen", "--multiple"],
+                                  Model.MAX_SMALL_RESPONSE_BYTES)
     pickProcess.running = true
   }
 
@@ -415,7 +429,7 @@ Item {
   // equivalent. Handles both plain paths and file:// URI lists.
   function uploadFromClipboard() {
     if (!signedIn || clipProcess.running) return
-    clipProcess.command = ["wl-paste", "--no-newline"]
+    clipProcess.command = bounded(["wl-paste", "--no-newline"], Model.MAX_SMALL_RESPONSE_BYTES)
     clipProcess.running = true
   }
 
@@ -443,8 +457,10 @@ Item {
     // inherit the SHELL's process group — so signalling just the `filen` pid
     // leaves rclone running, and group-killing our own group would take the
     // shell down with it. `setsid` puts each transfer in its own session and
-    // process group, so cancel can signal the whole group safely.
-    var wrapped = ["setsid"].concat(argv)
+    // process group, so cancel can signal the whole group safely. stdout is
+    // capped by the bounded wrapper; stderr passes through untouched to the
+    // line-by-line progress reader, which keeps only a bounded tail.
+    var wrapped = ["setsid"].concat(Model.boundedArgv(argv, Model.MAX_SMALL_RESPONSE_BYTES, 0))
     var proc = transferComponent.createObject(root, { transferId: id, argv: wrapped })
     if (!proc) { finishTransfer(id, 1, "Could not start transfer"); return }
     // Keep an explicit handle: scanning root.children for the process is
@@ -638,7 +654,7 @@ Item {
     if (remote === null) { showError("Unsupported name"); return }
     rmProcess.label = entry.display
     // No --permanent: items go to the Filen trash, so this is recoverable.
-    rmProcess.command = nativeArgs(["rm", "--", remote])
+    rmProcess.command = bounded(nativeArgs(["rm", "--", remote]), Model.MAX_SMALL_RESPONSE_BYTES)
     rmProcess.running = true
   }
 
@@ -646,7 +662,7 @@ Item {
     if (!Model.isUsableName(name) || mkdirProcess.running) { showError("Invalid folder name"); return }
     var p = Model.joinPath(currentPath, name)
     if (p === null) { showError("Invalid folder name"); return }
-    mkdirProcess.command = nativeArgs(["mkdir", "--", p])
+    mkdirProcess.command = bounded(nativeArgs(["mkdir", "--", p]), Model.MAX_SMALL_RESPONSE_BYTES)
     mkdirProcess.running = true
   }
 
@@ -666,7 +682,7 @@ Item {
       if (exitCode === 0 && p !== "" && p.charAt(0) === "/") {
         root.cliPath = p
         root.cliInstalled = true
-        versionProcess.command = [p, "--version"]
+        versionProcess.command = root.bounded([p, "--version"], 4096)
         versionProcess.running = true
         root.checkConfigPermissions()
       } else {
@@ -760,6 +776,16 @@ Item {
     onExited: function(exitCode) {
       root.listing = false
       if (generation !== root.generation) return
+      // Cut off at the ceiling: the partial output is not valid JSON and may
+      // be mostly remote filenames, so it is neither parsed nor classified.
+      if (Model.outputLimitHit(exitCode)) {
+        root.listRetries = 0
+        root.listError = "Folder too large to list here \u2014 open it on the web"
+        root.entries = []
+        root.entriesUpdated()
+        root.runChainedQuota()
+        return
+      }
       var all = root.combinedOutput(listOut.text, listErr.text)
       if (exitCode !== 0) {
         if (Model.isAuthError(all)) {
@@ -856,6 +882,7 @@ Item {
     onExited: function(exitCode) {
       // exit 1 = the user picked nothing; that is not an error.
       if (exitCode === 1) return
+      if (Model.outputLimitHit(exitCode)) { root.showError("Too many files selected"); return }
       if (exitCode !== 0) { root.showError("File chooser unavailable"); return }
       root.uploadPathList(pickOut.text)
     }
@@ -868,6 +895,7 @@ Item {
     command: []
     stdout: StdioCollector { id: clipOut; waitForEnd: true }
     onExited: function(exitCode) {
+      if (Model.outputLimitHit(exitCode)) { root.showError("Clipboard content is too large"); return }
       if (exitCode !== 0) { root.showError("Clipboard is empty"); return }
       root.uploadPathList(clipOut.text)
     }

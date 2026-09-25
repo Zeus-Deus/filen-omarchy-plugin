@@ -13,6 +13,44 @@ var MAX_STDERR_BYTES = 8 * 1024;
 var MAX_ENTRIES = 5000;                     // rows kept from a single listing
 var MAX_NAME_DISPLAY = 120;                 // chars shown in a row
 var MAX_PATH_DEPTH = 64;
+var MAX_SMALL_RESPONSE_BYTES = 64 * 1024;   // quota, rm/mkdir, transfer stdout, clipboard
+
+// ---------------------------------------------------------------- bounded output
+
+// A Quickshell StdioCollector keeps EVERYTHING a child writes until it exits,
+// so a size check after the fact is too late: a shared folder with millions
+// of entries (or a wedged CLI) would already have grown the shell's heap.
+// Every collector fed by the CLI therefore reads through this wrapper, which
+// stops at the ceiling while the child is still running.
+//
+//   bash -c BOUNDED_SCRIPT filen-bounded <outCap> <errCap> <argv...>
+//
+// * stdout: at most outCap bytes pass through. If even one more byte arrives,
+//   the wrapper exits OUTPUT_LIMIT_EXIT and closes the pipe, so the producer
+//   dies of SIGPIPE on its next write instead of running on.
+// * stderr: errCap > 0 keeps the first errCap bytes and discards the rest
+//   (drained, not closed, so chatty logging cannot kill a working command).
+//   errCap 0 passes stderr through untouched, for readers that already
+//   stream it line by line (transfer progress).
+// * Otherwise the exit status is the command's own (pipefail).
+// The body is a fixed literal; the command and its arguments arrive as
+// positional parameters and are never interpolated into script text.
+var OUTPUT_LIMIT_EXIT = 90;
+var BOUNDED_SCRIPT =
+  "o=$1 e=$2; shift 2; set -o pipefail; " +
+  "cap(){ head -c \"$o\"; [ \"$(head -c 1 | wc -c)\" -eq 0 ] || exit 90; }; " +
+  "if [ \"$e\" = 0 ]; then \"$@\" | cap; " +
+  "else { { \"$@\" | cap >&3; } 2>&1 | { head -c \"$e\" >&2; cat >/dev/null; }; } 3>&1; fi";
+
+function boundedArgv(argv, outCap, errCap) {
+  return ["bash", "-c", BOUNDED_SCRIPT, "filen-bounded",
+          String(Math.max(1, Math.floor(outCap))),
+          String(Math.max(0, Math.floor(errCap)))].concat(argv);
+}
+
+function outputLimitHit(exitCode) {
+  return exitCode === OUTPUT_LIMIT_EXIT;
+}
 
 // ---------------------------------------------------------------- text safety
 
@@ -402,6 +440,7 @@ function relativeTime(ms, nowMs) {
 // Map a CLI failure to something a human can act on. `stderr` is CLI-controlled
 // text, so it is sanitized and truncated before it ever reaches a Text element.
 function errorMessage(exitCode, stderr) {
+  if (outputLimitHit(exitCode)) return "Filen CLI output was too large to read";
   if (isAuthError(stderr)) return "Not signed in to Filen";
   if (isNotFoundError(stderr)) return "That folder no longer exists";
   if (isConfigRaceError(stderr)) return "Filen CLI config was busy \u2014 try again";
@@ -658,6 +697,11 @@ if (typeof module !== "undefined" && module.exports) {
     MAX_RESPONSE_BYTES: MAX_RESPONSE_BYTES,
     MAX_STDERR_BYTES: MAX_STDERR_BYTES,
     MAX_ENTRIES: MAX_ENTRIES,
+    MAX_SMALL_RESPONSE_BYTES: MAX_SMALL_RESPONSE_BYTES,
+    OUTPUT_LIMIT_EXIT: OUTPUT_LIMIT_EXIT,
+    BOUNDED_SCRIPT: BOUNDED_SCRIPT,
+    boundedArgv: boundedArgv,
+    outputLimitHit: outputLimitHit,
     sanitizeText: sanitizeText,
     isUsableName: isUsableName,
     joinPath: joinPath,

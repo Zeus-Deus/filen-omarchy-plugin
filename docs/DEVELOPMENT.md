@@ -15,7 +15,7 @@ from the bar.
 - `FilenIcon.qml` — the mark drawn natively on a `Canvas` (no bundled image).
 - `Model.js` — pure helpers: parsing, sanitisation, formatting, error
   classification. No Qt imports, Node-testable.
-- `tests/model.test.js` — 88 tests, `node --test tests/model.test.js`.
+- `tests/model.test.js` — 99 tests, `node --test tests/model.test.js`.
 - `tests/mock-filen` — fake CLI for states that are hard to reproduce live,
   and the demo drive behind `preview.png` / `docs/images/`.
 - `scripts/install-cli.sh` — pinned, SHA-256-checked CLI installer, run in
@@ -82,7 +82,12 @@ These are enforced by `scripts/security-audit.sh`; keep them true.
   A drive file named `ev<U+202E>gnp.exe` must never land as that name — it
   displays as `evexe.gnp` and hides the real extension.
 - All CLI output is size-capped and sanitized before display, and rendered as
-  `Text.PlainText`.
+  `Text.PlainText`. The cap is enforced **at ingestion**: a `StdioCollector`
+  buffers the whole stream until the child exits, so every collected command
+  runs through `Model.boundedArgv` (listing 4 MB, everything else 64 KB,
+  stderr 8 KB), which cuts the pipe mid-stream and exits
+  `OUTPUT_LIMIT_EXIT` (90). Checking the size after exit is too late.
+  A test pins that every `*Process.command` in `Service.qml` is bounded.
 - Every call carries `--skip-update`.
 - Deletes go to the Filen trash and are confirmation-gated. Never
   `--permanent`, never `empty-trash`.

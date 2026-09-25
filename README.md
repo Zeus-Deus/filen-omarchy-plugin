@@ -168,9 +168,11 @@ networking with Filen happens inside the CLI and its managed rclone.
   `;`, `$()`, backticks or newlines is inert data. Native verbs get `--` so a
   name starting with `-` can't become a flag.
 - **Remote output is treated as hostile.** Names come from shared folders and
-  can be anything. Responses are size-capped, JSON is parsed defensively, and
-  displayed text is stripped of control characters and bidi overrides, then
-  rendered as `PlainText`.
+  can be anything. Output is capped while the CLI is still writing (a
+  listing stops at 4 MB and shows "Folder too large to list here"), so a
+  huge or hostile folder can't grow the shell's memory. JSON is parsed
+  defensively, and displayed text is stripped of control characters and bidi
+  overrides, then rendered as `PlainText`.
 - **Downloads are written under a sanitized name and never overwrite.**
   The remote path stays byte-exact so the right object is fetched. The local
   filename has bidi and control characters removed. Without this, a drive

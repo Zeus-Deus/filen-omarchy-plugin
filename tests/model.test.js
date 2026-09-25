@@ -723,3 +723,101 @@ test("safeLocalName strips rclone control-picture stand-ins", () => {
   assert.strictEqual(M.safeLocalName("a\u2400b\u241Bc\u2421.txt"), "a_b_c_.txt");
   assert.strictEqual(M.safeLocalName("\u2420lead.txt"), "lead.txt");
 });
+
+// ─────────────────────────────────────────────── bounded CLI output
+// StdioCollector buffers a child's whole stream until it exits, so the size
+// ceiling has to be enforced while the child is writing. These run the real
+// wrapper script under bash against producers that never stop.
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+function runBounded(argv, outCap, errCap) {
+  const full = M.boundedArgv(argv, outCap, errCap);
+  const r = spawnSync(full[0], full.slice(1), { timeout: 20000, maxBuffer: 64 * 1024 * 1024 });
+  return { code: r.status, out: r.stdout, err: r.stderr, signal: r.signal };
+}
+
+test("bounded: small output passes through with the command's exit status", () => {
+  const r = runBounded(["bash", "-c", "printf hello; printf oops >&2; exit 3"], 100, 100);
+  assert.strictEqual(r.code, 3);
+  assert.strictEqual(r.out.toString(), "hello");
+  assert.strictEqual(r.err.toString(), "oops");
+});
+
+test("bounded: output exactly at the ceiling is not a cut-off", () => {
+  const r = runBounded(["printf", "hello"], 5, 100);
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.out.toString(), "hello");
+});
+
+test("bounded: one byte over the ceiling is reported, not silently truncated", () => {
+  const r = runBounded(["printf", "hello!"], 5, 100);
+  assert.strictEqual(r.code, M.OUTPUT_LIMIT_EXIT);
+  assert.strictEqual(r.out.length, 5);
+  assert.strictEqual(M.outputLimitHit(r.code), true);
+});
+
+test("bounded: an endless listing is cut at MAX_RESPONSE_BYTES and the producer stops", () => {
+  const t0 = Date.now();
+  const r = runBounded(["yes", '{"Name":"x","IsDir":false},'], M.MAX_RESPONSE_BYTES, M.MAX_STDERR_BYTES);
+  assert.strictEqual(r.signal, null, "wrapper must exit on its own, not hit the test timeout");
+  assert.strictEqual(r.code, M.OUTPUT_LIMIT_EXIT);
+  assert.strictEqual(r.out.length, M.MAX_RESPONSE_BYTES);
+  assert.ok(Date.now() - t0 < 10000);
+  // What the collector ends up holding is never handed to the parser as a listing.
+  assert.strictEqual(M.parseLsJson("[" + r.out.toString()), null);
+});
+
+test("bounded: endless stderr is capped but drained, so the command still completes", () => {
+  const r = runBounded(["bash", "-c", "head -c 5000000 /dev/zero | tr '\\0' e >&2; printf done"], 100, 64);
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.out.toString(), "done");
+  assert.strictEqual(r.err.length, 64);
+});
+
+test("bounded: errCap 0 leaves stderr untouched for the streaming progress reader", () => {
+  const r = runBounded(["bash", "-c", "printf 0123456789 >&2"], 10, 0);
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.err.toString(), "0123456789");
+});
+
+test("bounded: a missing binary still reads as a start failure (127)", () => {
+  const r = runBounded(["/nonexistent/filen-xyz"], 100, 100);
+  assert.strictEqual(r.code, 127);
+});
+
+test("bounded: hostile arguments are passed as data, never parsed as script", () => {
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "filen-bounded-"));
+  const marker = path.join(dir, "pwned");
+  const evil = "filen:/a; touch " + marker + " $(touch " + marker + ") `touch " + marker + "`";
+  const r = runBounded(["printf", "%s", evil], 4096, 100);
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.out.toString(), evil);
+  assert.strictEqual(fs.existsSync(marker), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("bounded: argv shape keeps the script a fixed literal", () => {
+  const a = M.boundedArgv(["filen", "--skip-update", "rclone", "lsjson", "filen:/x"], 10, 20);
+  assert.deepStrictEqual(a.slice(0, 6), ["bash", "-c", M.BOUNDED_SCRIPT, "filen-bounded", "10", "20"]);
+  assert.deepStrictEqual(a.slice(6), ["filen", "--skip-update", "rclone", "lsjson", "filen:/x"]);
+});
+
+test("errorMessage explains an output cut-off", () => {
+  assert.strictEqual(M.errorMessage(M.OUTPUT_LIMIT_EXIT, ""), "Filen CLI output was too large to read");
+});
+
+test("Service: every CLI/child whose output is collected goes through the bounded wrapper", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "Service.qml"), "utf8");
+  // Fixed local scripts with a few bytes of output are the only exceptions.
+  const exempt = /whichProcess|permProcess|permFixProcess|reachProcess/;
+  const assigns = src.split("\n").filter(l => /^\s*\w+Process\.command\s*=/.test(l));
+  assert.ok(assigns.length >= 8, "found " + assigns.length + " command assignments");
+  for (const line of assigns) {
+    if (exempt.test(line)) continue;
+    assert.match(line, /=\s*(root\.)?bounded\(/, "unbounded command: " + line.trim());
+  }
+  assert.match(src, /\["setsid"\]\.concat\(Model\.boundedArgv\(/, "transfers must be bounded too");
+});
