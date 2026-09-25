@@ -205,7 +205,7 @@ and no findings. It comes from `scripts/install-cli.sh`, which exists so a
 missing Filen CLI can be installed from the panel:
 
 - It runs only when you press **Install** (or `Enter`) on the "CLI not
-  installed" panel (`Service.qml:607`). The panel launches Omarchy's
+  installed" panel (`runCliInstaller()` in `Service.qml`). The panel launches Omarchy's
   `omarchy-launch-floating-terminal-with-presentation` with a fixed command
   (the script's path in the plugin folder). Nothing from the drive, the
   settings or the CLI is put into it. Nothing runs when the plugin is
