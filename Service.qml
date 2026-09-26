@@ -347,48 +347,70 @@ Item {
     pushTransfer(t)
 
     // Never overwrite: `rclone copyto` silently replaces an existing local
-    // file, so a second "report.pdf" would destroy the first. Pick a free
-    // name ("report (1).pdf") before starting, also avoiding names already
-    // claimed by downloads still in flight.
+    // file, so a second "report.pdf" would destroy the first. Claim a free
+    // name ("report (1).pdf") ON DISK before starting. The claim is an
+    // atomic exclusive create, so two downloads resolving at the same time,
+    // or another program writing into the folder meanwhile, can never end
+    // up sharing a path: whoever creates the name first owns it.
     var parts = Model.splitExtension(localName, t.isDir)
     var argv = ["bash", "-c", root.freeNameScript, "filen-free-name",
-                downloadDir, parts.stem, parts.ext].concat(pendingLocalPaths())
+                downloadDir, parts.stem, parts.ext, t.isDir ? "dir" : "file"]
     var proc = resolveComponent.createObject(root, { transferId: id, argv: argv })
     if (!proc) { finishTransfer(id, 1, "Could not start transfer"); return }
     proc.running = true
   }
 
-  // Prints "$dir/$stem$ext", or the first "$dir/$stem (N)$ext" that neither
-  // exists on disk nor appears in the reserved list ($4...). Values arrive as
-  // positional parameters; the body is a fixed literal.
+  // Claims "$dir/$stem$ext", or the first free "$dir/$stem (N)$ext", and
+  // prints it. The claim is exclusive: `mkdir` for a folder, and for a file
+  // a noclobber create, which is open(O_CREAT|O_EXCL) and so fails if the
+  // name exists, even as a dangling symlink. Existing names are skipped
+  // before the create so it never opens a FIFO or device someone left there.
+  // rclone then fills in the empty placeholder it was given. Values arrive
+  // as positional parameters; the body is a fixed literal.
   readonly property string freeNameScript:
-    "d=$1 s=$2 e=$3; shift 3; " +
-    "taken(){ { [ -e \"$1\" ] || [ -L \"$1\" ]; } && return 0; " +
-    "for r in \"${R[@]}\"; do [ \"$r\" = \"$1\" ] && return 0; done; return 1; }; " +
-    "R=(\"$@\"); p=\"$d/$s$e\"; n=1; " +
-    "while taken \"$p\"; do [ $n -gt 999 ] && exit 1; p=\"$d/$s ($n)$e\"; n=$((n+1)); done; " +
+    "d=$1 s=$2 e=$3 k=$4; p=\"$d/$s$e\"; n=1; " +
+    "while :; do " +
+    "if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then " +
+    "if [ \"$k\" = dir ]; then mkdir -- \"$p\" 2>/dev/null && break; " +
+    "else ( set -C; : > \"$p\" ) 2>/dev/null && break; fi; fi; " +
+    "[ $n -gt 999 ] && exit 1; p=\"$d/$s ($n)$e\"; n=$((n+1)); done; " +
     "printf '%s' \"$p\""
 
-  function pendingLocalPaths() {
-    var out = []
-    for (var i = 0; i < transfers.length; i++) {
-      var t = transfers[i]
-      if (t.kind === "download" && t.state === "running" && t.localPath) out.push(t.localPath)
-    }
-    return out
+  // Removes a download placeholder that never received any data: an empty
+  // regular file or an empty folder, never a symlink. rclone writes into a
+  // temporary name and only renames over the placeholder on success, so a
+  // failed or canceled download leaves it empty. A folder download that
+  // wrote some files before failing keeps them (`rmdir` refuses).
+  readonly property string discardPlaceholderScript:
+    "p=$1; [ -L \"$p\" ] && exit 0; " +
+    "if [ -d \"$p\" ]; then rmdir -- \"$p\" 2>/dev/null; " +
+    "elif [ -f \"$p\" ] && [ ! -s \"$p\" ]; then rm -f -- \"$p\"; fi; exit 0"
+
+  function discardPlaceholder(local) {
+    if (!isDownloadChild(local)) return
+    Quickshell.execDetached(["bash", "-c", root.discardPlaceholderScript,
+                             "filen-discard", local])
+  }
+
+  // A resolved download path must be a direct child of the download
+  // directory, with no control characters.
+  function isDownloadChild(local) {
+    var s = String(local || "")
+    var prefix = downloadDir === "/" ? "/" : downloadDir + "/"
+    var rest = s.indexOf(prefix) === 0 ? s.slice(prefix.length) : ""
+    return rest !== "" && rest.indexOf("/") === -1 && !/[\u0000-\u001F]/.test(rest)
   }
 
   function beginDownload(id, local) {
     var t = null
     for (var i = 0; i < transfers.length; i++) if (transfers[i].id === id) t = transfers[i]
-    if (!t || t.state !== "running") return
-    // The resolved path must be a direct child of the download directory.
-    var prefix = downloadDir === "/" ? "/" : downloadDir + "/"
-    var rest = local.indexOf(prefix) === 0 ? local.slice(prefix.length) : ""
-    if (rest === "" || rest.indexOf("/") !== -1 || /[\u0000-\u001F]/.test(rest)) {
+    if (!isDownloadChild(local)) {
       finishTransfer(id, 1, "Could not choose a download name")
       return
     }
+    // The row went away (cleared or trimmed) while the name was being
+    // claimed: release the claim instead of leaving an empty file behind.
+    if (!t || t.state !== "running") { discardPlaceholder(local); return }
     updateTransfer(id, { localPath: local })
     // `copy` places a folder's CONTENTS into dest, so dest is named after the
     // (sanitized) folder; `copyto` writes exactly the one path we chose.
@@ -513,6 +535,7 @@ Item {
     cancelKillTimer.pending = 0
     if (!ok && !canceled && Model.isAuthError(output)) { signedIn = false; authChecked = true }
     if (!t) return
+    if (!ok && t.kind === "download" && t.localPath) discardPlaceholder(t.localPath)
     if (ok) {
       if (t.kind === "download") {
         showStatus("Downloaded " + t.label)

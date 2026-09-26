@@ -148,7 +148,12 @@ PY
           sleep 1
         done
         src="${ARGS[2]:-}"; dst="${ARGS[3]:-}"
-        [[ "$src" == filen:* && -n "$dst" && "$dst" != filen:* ]] && echo "mock content" > "$dst"
+        if [[ "$src" == filen:* && -n "$dst" && "$dst" != filen:* ]]; then
+          # `copy` fills a destination folder (creating it if needed);
+          # `copyto` writes exactly the destination file.
+          if [[ "$sub" == copy ]]; then mkdir -p -- "$dst" && echo "mock content" > "$dst/item.txt"
+          else echo "mock content" > "$dst"; fi
+        fi
         ;;
       *) echo "error: unsupported mock rclone verb '$sub'"; exit 2 ;;
     esac

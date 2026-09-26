@@ -91,8 +91,12 @@ These are enforced by `scripts/security-audit.sh`; keep them true.
 - Every call carries `--skip-update`.
 - Deletes go to the Filen trash and are confirmation-gated. Never
   `--permanent`, never `empty-trash`.
-- Downloads never overwrite: a free local name is resolved first
-  (`freeNameScript`). `xdg-open` is only used for `Model.isSafeToOpen`
+- Downloads never overwrite: a free local name is claimed on disk first
+  (`freeNameScript`: `mkdir`, or a noclobber `O_EXCL` create for a file).
+  Never replace that with an in-memory list of reserved names; resolvers
+  run asynchronously, so a list snapshot races. A failed or canceled
+  download removes its placeholder only if it is still empty
+  (`discardPlaceholderScript`). `xdg-open` is only used for `Model.isSafeToOpen`
   types; launchers/scripts/HTML are revealed, never opened.
 - No literal elevation-command names anywhere in tracked source — the
   marketplace security baseline greps for them, even in this audit script.

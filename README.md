@@ -178,7 +178,9 @@ networking with Filen happens inside the CLI and its managed rclone.
   filename has bidi and control characters removed. Without this, a drive
   file called `ev<U+202E>gnp.exe` would land on your disk displaying as
   `evexe.gnp`. If the name is already taken, the download is saved as
-  `name (1).ext` and your existing file is left alone.
+  `name (1).ext` and your existing file is left alone. The name is claimed on
+  disk before the download starts, so two downloads started at the same time
+  never share a path.
 - **Only viewable types are auto-opened.** `Enter`/`o` hands images, video,
   audio, PDFs and plain text to `xdg-open`. Launchers (`.desktop`), scripts,
   HTML, SVG and executables are downloaded and then shown in their folder,

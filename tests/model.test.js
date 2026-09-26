@@ -821,3 +821,110 @@ test("Service: every CLI/child whose output is collected goes through the bounde
   }
   assert.match(src, /\["setsid"\]\.concat\(Model\.boundedArgv\(/, "transfers must be bounded too");
 });
+
+// ─────────────────────────────────────────────── download name claims
+// Downloads never overwrite. The free name is CLAIMED on disk with an
+// exclusive create, so two downloads resolving at the same moment (or any
+// other writer in the folder) can never be handed the same path.
+
+function qmlStringProperty(name) {
+  const src = fs.readFileSync(path.join(__dirname, "..", "Service.qml"), "utf8");
+  const m = src.match(new RegExp("readonly property string " + name + ":\\s*\\n((?:\\s*\".*\"\\s*\\+?\\s*\\n)+)"));
+  assert.ok(m, name + " not found in Service.qml");
+  // The property is a concatenation of plain JS string literals.
+  return require("node:vm").runInNewContext(m[1]);
+}
+
+function claim(dir, stem, ext, kind) {
+  const r = spawnSync("bash", ["-c", qmlStringProperty("freeNameScript"), "filen-free-name", dir, stem, ext, kind]);
+  return { code: r.status, path: r.stdout.toString() };
+}
+
+test("freeNameScript claims the name on disk and skips taken ones", () => {
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "filen-claim-"));
+  fs.writeFileSync(path.join(dir, "report.pdf"), "keep me");
+  fs.symlinkSync("/nonexistent", path.join(dir, "report (1).pdf"));   // dangling
+  const a = claim(dir, "report", ".pdf", "file");
+  assert.strictEqual(a.code, 0);
+  assert.strictEqual(a.path, path.join(dir, "report (2).pdf"));
+  assert.strictEqual(fs.statSync(a.path).size, 0, "placeholder is created empty");
+  assert.strictEqual(fs.readFileSync(path.join(dir, "report.pdf"), "utf8"), "keep me");
+  // The claim itself makes the next caller move on, no shared state needed.
+  assert.strictEqual(claim(dir, "report", ".pdf", "file").path, path.join(dir, "report (3).pdf"));
+  const d = claim(dir, "Trip", "", "dir");
+  assert.ok(fs.statSync(d.path).isDirectory());
+  assert.strictEqual(claim(dir, "Trip", "", "dir").path, path.join(dir, "Trip (1)"));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("freeNameScript: simultaneous claims of one name never share a path", async () => {
+  const { spawn } = require("node:child_process");
+  const script = qmlStringProperty("freeNameScript");
+  for (const kind of ["file", "dir"]) {
+    const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "filen-race-"));
+    const runs = Array.from({ length: 24 }, () => new Promise((resolve) => {
+      const p = spawn("bash", ["-c", script, "filen-free-name", dir, "same", kind === "dir" ? "" : ".jpg", kind]);
+      let out = "";
+      p.stdout.on("data", (b) => { out += b; });
+      p.on("close", (code) => resolve({ code, out }));
+    }));
+    const results = await Promise.all(runs);
+    const paths = results.map((r) => { assert.strictEqual(r.code, 0); return r.out; });
+    assert.strictEqual(new Set(paths).size, paths.length, kind + ": duplicate claim " + paths.join(" | "));
+    assert.strictEqual(fs.readdirSync(dir).length, paths.length);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("freeNameScript never opens a FIFO or writes through a symlink", () => {
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "filen-claim-"));
+  spawnSync("mkfifo", [path.join(dir, "x.txt")]);
+  const outside = path.join(dir, "outside");
+  fs.symlinkSync(outside, path.join(dir, "x (1).txt"));
+  const r = spawnSync("bash", ["-c", qmlStringProperty("freeNameScript"), "filen-free-name", dir, "x", ".txt", "file"],
+                      { timeout: 5000 });
+  assert.strictEqual(r.signal, null, "must not block on the FIFO");
+  assert.strictEqual(r.stdout.toString(), path.join(dir, "x (2).txt"));
+  assert.strictEqual(fs.existsSync(outside), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("freeNameScript: hostile names are data, never script", () => {
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "filen-claim-"));
+  // Local names never contain "/", so the payload uses a relative marker
+  // and runs with the temp dir as cwd.
+  const stem = "$(touch pwned) `touch pwned`; touch pwned";
+  const r = spawnSync("bash", ["-c", qmlStringProperty("freeNameScript"), "filen-free-name", dir, stem, ".txt", "file"],
+                      { cwd: dir });
+  assert.strictEqual(r.status, 0);
+  assert.strictEqual(r.stdout.toString(), path.join(dir, stem + ".txt"));
+  assert.strictEqual(fs.existsSync(path.join(dir, "pwned")), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("discardPlaceholderScript removes only an empty claim, never data or links", () => {
+  const dir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "filen-discard-"));
+  const script = qmlStringProperty("discardPlaceholderScript");
+  const run = (p) => spawnSync("bash", ["-c", script, "filen-discard", p]).status;
+  const j = (n) => path.join(dir, n);
+  fs.writeFileSync(j("empty.pdf"), "");
+  fs.writeFileSync(j("full.pdf"), "data");
+  fs.mkdirSync(j("emptydir"));
+  fs.mkdirSync(j("partdir")); fs.writeFileSync(j("partdir/a"), "x");
+  fs.writeFileSync(j("target"), "");
+  fs.symlinkSync(j("target"), j("link.pdf"));
+  for (const n of ["empty.pdf", "full.pdf", "emptydir", "partdir", "link.pdf", "missing"]) assert.strictEqual(run(j(n)), 0);
+  assert.strictEqual(fs.existsSync(j("empty.pdf")), false);
+  assert.strictEqual(fs.existsSync(j("emptydir")), false);
+  assert.strictEqual(fs.readFileSync(j("full.pdf"), "utf8"), "data");
+  assert.ok(fs.existsSync(j("partdir/a")));
+  assert.ok(fs.lstatSync(j("link.pdf")).isSymbolicLink());
+  assert.ok(fs.existsSync(j("target")));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("Service: download names are claimed on disk, not reserved in memory", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "Service.qml"), "utf8");
+  assert.doesNotMatch(src, /pendingLocalPaths/, "an in-memory reservation list races across async resolvers");
+  assert.match(src, /freeNameScript, "filen-free-name",\s*\n\s*downloadDir, parts\.stem, parts\.ext, t\.isDir \? "dir" : "file"\]/);
+});
